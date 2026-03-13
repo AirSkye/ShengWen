@@ -296,10 +296,16 @@ chmod +x 一键启动.sh
 或者双击运行 `一键启动.bat`
 
 **手动启动：**
+若一键启动遇到问题，也可尝试手动启动：
 ```bash
 # Linux/macOS（若使用 deploy 脚本安装）
 source .venv/bin/activate
 python ShengWen-app.py
+```
+
+```bash
+# Windows
+.\.venv\Scripts\python.exe ShengWen-app.py
 ```
 请注意使用创建的虚拟环境中的 python 来启动，否则可能缺少依赖而报错
 
