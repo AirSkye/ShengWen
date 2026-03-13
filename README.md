@@ -1,5 +1,4 @@
-
-# 声文智汇（ShengWen）- Agent驱动的长视频总结
+# 声文智汇（ShengWen）- Agent驱动的长视频总结工作流
 
 <p align="center">
   <img src="prj-docs/images/web-wide.png" alt="最终生成图片预览" width="900">
@@ -203,13 +202,14 @@
 请阅读这个项目的 README.md，然后帮我完成部署
 ```
 
-AI agent 会自动：
+AI agent 会尝试：
 - 理解项目结构和依赖
 - 执行前端构建和后端依赖安装
 - 处理可能遇到的问题
 - 启动服务
 
-这是最省心的部署方式，特别适合不熟悉命令行操作的用户。
+……能够更好地应对多变的系统环境。
+
 
 ---
 
@@ -295,10 +295,16 @@ chmod +x 一键启动.sh
 或者双击运行 `一键启动.bat`
 
 **手动启动：**
+若一键启动遇到问题，也可尝试手动启动：
 ```bash
 # Linux/macOS（若使用 deploy 脚本安装）
 source .venv/bin/activate
 python ShengWen-app.py
+```
+
+```bash
+# Windows
+.\.venv\Scripts\python.exe ShengWen-app.py
 ```
 请注意使用创建的虚拟环境中的 python 来启动，否则可能缺少依赖而报错
 
