@@ -1,5 +1,5 @@
 
-# 声文智汇（ShengWen）- 让刷课更爽
+# 声文智汇（ShengWen）- Agent驱动的长视频总结工作流
 
 <p align="center">
   <img src="prj-docs/images/web-wide.png" alt="最终生成图片预览" width="900">
