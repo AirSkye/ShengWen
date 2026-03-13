@@ -311,7 +311,11 @@ async def notify_task_update(task_id: str, task_data: dict = None):
             "type": "task_update",
             "task": task_data
         })
+
         await manager.broadcast(message)
+    else:
+        # 添加日志：任务不存在
+        logger.warning(f"[WebSocket] Task not found for broadcast: task_id={task_id}")
 
 async def notify_progress_update(task_id: str, progress: float):
     """直接向客户端广播一个轻量级的进度更新事件。"""

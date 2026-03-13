@@ -155,6 +155,11 @@ class LLMWorker(Worker):
             return
 
         if task_id:
+            logger.info(
+                f"[LLMWorker] Finalizing task: task_id={task_id}, "
+                f"status: SUMMARIZING→COMPLETED"
+            )
+
             from ..db import db, TaskStatus
 
             update_data: dict[str, Any] = {
@@ -232,28 +237,49 @@ class LLMWorker(Worker):
             LLMMessage(role="user", content=transcript_text),
         ]
         response_chunks: list[str] = []
-        last_update = asyncio.get_event_loop().time()
         llm_error: LLMError | None = None
 
-        async def flush_partial_summary():
-            if not task_id:
-                return
-            from ..db import TaskStatus
-            from ..task_updater import update_and_notify
+        # 防抖控制
+        last_update_time = 0.0
+        update_in_progress = False
 
-            await update_and_notify(
-                task_id,
-                {
-                    "status": TaskStatus.SUMMARIZING,
-                    "summary": "".join(response_chunks),
-                    "summary_mode": "standard",
-                    "summary_chunk_total": None,
-                    "summary_chunk_done": None,
-                },
-            )
+        async def flush_partial_summary():
+            nonlocal last_update_time, update_in_progress
+
+            if not task_id or update_in_progress:
+                return
+
+            # 防抖：距离上次更新不足0.5秒则跳过
+            now = asyncio.get_event_loop().time()
+            if now - last_update_time < 0.5:
+                return
+
+            update_in_progress = True
+            try:
+                from ..db import db, TaskStatus
+                from ..task_updater import update_and_notify
+
+                # 只有当任务仍在 SUMMARIZING 状态时才更新，避免覆盖 COMPLETED 状态
+                current_task = db.get_task(task_id)
+                if not current_task or current_task.get("status") != TaskStatus.SUMMARIZING:
+                    return
+
+                await update_and_notify(
+                    task_id,
+                    {
+                        "status": TaskStatus.SUMMARIZING,
+                        "summary": "".join(response_chunks),
+                        "summary_mode": "standard",
+                        "summary_chunk_total": None,
+                        "summary_chunk_done": None,
+                    },
+                )
+                last_update_time = now
+            finally:
+                update_in_progress = False
 
         def callback(chunk: str | LLMError):
-            nonlocal llm_error, last_update
+            nonlocal llm_error
             if task_id and self.is_task_cancelled(task_id):
                 raise asyncio.CancelledError()
 
@@ -262,10 +288,9 @@ class LLMWorker(Worker):
                 return
 
             response_chunks.append(chunk)
-            now = asyncio.get_event_loop().time()
-            if task_id and now - last_update >= 0.5:
+            # 每次收到新内容就尝试更新（防抖在flush内部处理）
+            if task_id:
                 self._submit_coro(flush_partial_summary())
-                last_update = now
 
         await self._llm_client.response(messages=messages, resp_callback=callback)
         if llm_error:

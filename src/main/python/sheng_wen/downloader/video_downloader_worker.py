@@ -461,6 +461,11 @@ class VideoDownloaderWorker(Worker):
                 self._submit_coro(self._resolve_and_save_bilibili_author(task_id, str(video_url)))
 
             if task_id:
+                logger.info(
+                    f"[VideoDownloader] Download completed: task_id={task_id}, "
+                    f"status: DOWNLOADING→TRANSCRIBING, video={video_path}"
+                )
+
                 from ..db import TaskStatus
                 from ..task_updater import update_and_notify
                 self._submit_coro(update_and_notify(task_id, {"status": TaskStatus.TRANSCRIBING}))

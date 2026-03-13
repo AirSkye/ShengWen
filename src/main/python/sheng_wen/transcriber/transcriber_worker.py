@@ -328,7 +328,14 @@ class TranscriberWorker(Worker):
                 with open(intermediate_file_path, "r", encoding="utf-8") as f:
                     transcript = f.read()
                 summary_mode = str(payload.get("summary_mode") or "").strip().lower()
-                
+
+                # 转录完成，准备进入总结阶段
+                logger.info(
+                    f"[TranscriberWorker] Transcription completed: task_id={task_id}, "
+                    f"status: TRANSCRIBING→SUMMARIZING, "
+                    f"duration={result.transcription_time:.2f}s, audio_duration={result.audio_duration:.2f}s"
+                )
+
                 update_data = {
                     "status": TaskStatus.SUMMARIZING,
                     "progress": 0.0,
