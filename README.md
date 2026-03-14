@@ -208,7 +208,32 @@ AI agent 会尝试：
 - 处理可能遇到的问题
 - 启动服务
 
-……能够更好地应对多变的系统环境。
+给 Agent 的提示词：
+```
+如果你是 AI Agent，请按以下步骤帮助用户完成部署：
+
+1. **检测操作系统**：判断是 Linux/macOS 还是 Windows
+2. **运行部署脚本**（不要自己写命令，使用现有脚本）：
+   - Linux/macOS: `chmod +x deploy一键部署.sh && ./deploy一键部署.sh`
+   - Windows: `deploy一键部署.bat`
+3. **等待部署完成**：脚本会自动完成环境检查、依赖安装、前端构建
+4. **运行启动脚本**（不要自己写命令，使用现有脚本）：
+   - Linux/macOS: `chmod +x run一键启动.sh && ./run一键启动.sh`
+   - Windows: `run一键启动.bat`
+5. **确认服务启动**：看到 "🚀 服务启动完成" 提示后，告知用户访问 http://localhost:8000
+
+**重要**：
+- 不要尝试手动执行 `pip install` 或 `npm install`，脚本已包含这些步骤
+- 不要修改脚本内容，除非遇到明确的错误
+- 如果部署脚本报错，先阅读错误信息，再决定是否需要手动干预
+- 配置文件（LLM API Key 等）可以在服务启动后通过前端设置面板配置
+
+**常见问题处理**：
+- 如果提示 Node.js 版本过低：建议用户升级到 Node.js 20+
+- 如果提示 Python 版本过低：建议用户升级到 Python 3.10+，但也不建议使用太新的版本
+- 如果前端构建失败：检查 npm 是否正常，必要时清理 `frontend/node_modules` 后重试
+- 如果启动时提示缺少 `frontend/dist`：重新运行部署脚本
+```
 
 
 ---
@@ -282,17 +307,17 @@ cp config/settings.example.json config/settings.json
 
 ### 启动服务
 
-**一键启动（Linux/macOS）：**
+**run一键启动（Linux/macOS）：**
 ```bash
-chmod +x 一键启动.sh
-./一键启动.sh
+chmod +x run一键启动.sh
+./run一键启动.sh
 ```
 
 **一键启动（Windows）：**
 ```cmd
-一键启动.bat
+run一键启动.bat
 ```
-或者双击运行 `一键启动.bat`
+或者双击运行 `run一键启动.bat`
 
 **手动启动：**
 若一键启动遇到问题，也可尝试手动启动：

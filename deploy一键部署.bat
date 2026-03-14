@@ -262,7 +262,7 @@ echo ✅ 部署完成！
 echo ==========================================
 echo.
 echo 下一步操作：
-echo 1. 启动服务: .\%VENV_DIR%\Scripts\python.exe ShengWen-app.py
+echo 1. 启动服务: ./run一键启动.bat 或者 .\%VENV_DIR%\Scripts\python.exe ShengWen-app.py
 echo 2. 打开浏览器: http://localhost:8000/
 echo 3. 在前端设置面板中填写 LLM 与转录参数
 echo.
