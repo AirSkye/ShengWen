@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -14,6 +15,45 @@ from .chunker import TranscriptChunk, split_transcript_into_chunks, tail_timesta
 from .prompt_builder import build_chunk_user_prompt, generate_structure_overview
 from .protocol import parse_state_ops, strip_state_instruction_blocks
 from .state_manager import DynamicStateManager
+
+
+def remove_duplicate_paragraphs(text: str) -> str:
+    """移除连续重复的段落"""
+    paragraphs = text.split('\n\n')
+    result = []
+    prev = None
+    for para in paragraphs:
+        para_stripped = para.strip()
+        if para_stripped and para_stripped != prev:
+            result.append(para)
+            prev = para_stripped
+    return '\n\n'.join(result)
+
+
+def truncate_after_state_ops(text: str) -> str:
+    """截断state_ops之后的所有内容"""
+    pattern = r'(```state_ops\s*\{[^`]*\}\s*```)'
+    matches = list(re.finditer(pattern, text, re.DOTALL))
+    if matches:
+        last_match = matches[-1]
+        truncated = text[:last_match.end()]
+        if truncated != text:
+            logger.info(f"[ChunkedSummarizer] 截断了state_ops之后的内容，移除了 {len(text) - len(truncated)} 个字符")
+        return truncated
+    return text
+
+
+def truncate_discussed_topics(topics: str, max_items: int = 10) -> str:
+    """只保留最近的N个标题，避免过长"""
+    if not topics:
+        return topics
+
+    items = [item.strip() for item in topics.split(';') if item.strip()]
+    if len(items) > max_items:
+        truncated = '; '.join(items[-max_items:])
+        logger.info(f"[ChunkedSummarizer] 截断已讨论主题从 {len(items)} 项到 {max_items} 项")
+        return truncated
+    return topics
 
 
 @dataclass
@@ -158,13 +198,18 @@ class ChunkedSummarizer:
         prev_summary = chunk_outputs[-1] if chunk_outputs else ""
         # 清理 state_ops 块后再取末尾，避免将 state_ops 内容传递给下一块
         prev_summary_cleaned = strip_state_instruction_blocks(prev_summary)
+
+        # 取末尾片段并去重
+        prev_summary_tail = prev_summary_cleaned[-self._prev_summary_tail_chars_j:]
+        prev_summary_tail = remove_duplicate_paragraphs(prev_summary_tail)
+
         state.set_program_value(
             "前块转录文本末尾",
             f"```plaintext\n{tail_timestamp_lines(prev_chunk, self._prev_tail_timestamp_lines_m)}\n```",
         )
         state.set_program_value(
             "前块总结片段末尾",
-            f"```markdown\n{prev_summary_cleaned[-self._prev_summary_tail_chars_j:]}\n```",
+            f"```markdown\n{prev_summary_tail}\n```",
         )
 
     async def _call_llm_with_retry(
@@ -230,6 +275,10 @@ class ChunkedSummarizer:
             raise llm_error
         self._ensure_not_cancelled()
         final_text = "".join(response_chunks)
+
+        # 截断state_ops之后的所有内容（防止思考过程泄露）
+        final_text = truncate_after_state_ops(final_text)
+
         if on_partial and len(final_text) != last_emit_len:
             try:
                 on_partial(final_text)

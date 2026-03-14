@@ -1,6 +1,11 @@
 import { buildTimestampJumpUrl, toTimestampSeconds } from './videoTimeJump'
 
-const TIMESTAMP_MARK_RE = /([（(])\s*见\s*(\d{1,2}):([0-5]\d):([0-5]\d)\s*([）)])/g
+// 支持多种时间戳格式：
+// - (见 HH:MM:SS) / （见 HH:MM:SS）
+// - (HH:MM:SS) / （HH:MM:SS）
+// - 支持半角和全角括号
+// - "见"字可选
+const TIMESTAMP_MARK_RE = /([（(])\s*(?:见\s*)?(\d{1,2}):([0-5]\d):([0-5]\d)\s*([）)])/g
 
 export interface TimestampChipReplaceOptions {
   videoUrl?: string

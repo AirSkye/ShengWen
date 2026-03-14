@@ -9,6 +9,16 @@ CHUNK_START_RE = re.compile(r"\{\{chunk_(\d+)_start\}\}", re.IGNORECASE)
 CHUNK_END_RE = re.compile(r"\{\{chunk_(\d+)_ended\}\}", re.IGNORECASE)
 
 
+def remove_program_markers(text: str) -> str:
+    """移除所有程序内部标记"""
+    # 移除 {{chunk_N_start}} 和 {{chunk_N_ended}}
+    text = CHUNK_START_RE.sub("", text)
+    text = CHUNK_END_RE.sub("", text)
+    # 清理多余的空行
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
 def assemble_chunk_summaries(chunk_summaries: list[str]) -> tuple[str, list[str]]:
     if not chunk_summaries:
         return ("", [])
@@ -45,9 +55,8 @@ def assemble_chunk_summaries(chunk_summaries: list[str]) -> tuple[str, list[str]
         logs.append(f"块 {idx}: 追加正文")
 
     final = "\n\n".join(parts).strip()
-    final = CHUNK_START_RE.sub("", final)
-    final = CHUNK_END_RE.sub("", final)
-    final = re.sub(r"\n{3,}", "\n\n", final).strip()
+    # 使用统一的清理函数移除所有程序标记
+    final = remove_program_markers(final)
     logs.append(f"组装完成，最终长度: {len(final)} 字符")
     return (final, logs)
 

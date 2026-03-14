@@ -41,14 +41,22 @@ class DynamicStateManager:
                 continue
 
             if op.action == "set":
-                self._agent[key] = _truncate(op.value or "", max_value_chars)
+                value = _truncate(op.value or "", max_value_chars)
+                # 对"已讨论主题"做特殊处理，限制项目数
+                if key == "已讨论主题":
+                    value = _truncate_discussed_topics(value, max_items=10)
+                self._agent[key] = value
             elif op.action == "append":
                 appended = (op.value or "").strip()
                 if not appended:
                     continue
                 current = (self._agent.get(key) or "").strip()
                 merged = f"{current}; {appended}" if current else appended
-                self._agent[key] = _truncate(_normalize_semicolon_items(merged), max_value_chars)
+                value = _truncate(_normalize_semicolon_items(merged), max_value_chars)
+                # 对"已讨论主题"做特殊处理，限制项目数
+                if key == "已讨论主题":
+                    value = _truncate_discussed_topics(value, max_items=10)
+                self._agent[key] = value
             elif op.action == "remove":
                 to_remove = (op.value or "").strip()
                 if not to_remove:
@@ -114,4 +122,15 @@ def _truncate(value: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[-max_chars:]
+
+
+def _truncate_discussed_topics(topics: str, max_items: int = 10) -> str:
+    """只保留最近的N个标题项，避免过长"""
+    if not topics:
+        return topics
+
+    items = [item.strip() for item in topics.split(';') if item.strip()]
+    if len(items) > max_items:
+        return '; '.join(items[-max_items:])
+    return topics
 

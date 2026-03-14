@@ -26,6 +26,7 @@ class Worker(ABC):
         self._cancelled_task_ids: set[str] = set()
         self._active_task_id: str | None = None
         self._active_process_task: asyncio.Task | None = None
+        self._pending_updates: set[asyncio.Future] = set()
 
     @staticmethod
     def _extract_task_id(payload: Any) -> str | None:
@@ -51,9 +52,42 @@ class Worker(ABC):
     def _submit_coro(self, coro: Coroutine) -> None:
         """
         从工作线程安全地向主事件循环提交一个协程。
+        跟踪提交的协程以便后续等待完成。
         """
         if self._loop:
-            asyncio.run_coroutine_threadsafe(coro, self._loop)
+            future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+            self._pending_updates.add(future)
+            # 自动清理已完成的 future
+            future.add_done_callback(lambda f: self._pending_updates.discard(f))
+
+    async def _await_pending_updates(self, timeout: float = 5.0) -> None:
+        """
+        等待所有待处理的更新完成。
+
+        Args:
+            timeout: 最大等待时间（秒）
+        """
+        if not self._pending_updates:
+            return
+
+        pending_count = len(self._pending_updates)
+        logger.info(f"[{self.name}] 等待 {pending_count} 个待处理更新完成...")
+
+        start_time = asyncio.get_event_loop().time()
+        while self._pending_updates:
+            elapsed = asyncio.get_event_loop().time() - start_time
+            if elapsed > timeout:
+                logger.warning(
+                    f"[{self.name}] 等待更新超时 ({timeout}s)，"
+                    f"仍有 {len(self._pending_updates)} 个更新未完成"
+                )
+                break
+
+            # 等待一小段时间后重新检查
+            await asyncio.sleep(0.05)
+
+        if not self._pending_updates:
+            logger.info(f"[{self.name}] 所有待处理更新已完成")
 
     def is_task_cancelled(self, task_id: str | None) -> bool:
         if not task_id:
@@ -151,8 +185,12 @@ class Worker(ABC):
                             await self._active_process_task
                         else:
                             # 同步任务在线程中执行，避免阻塞事件循环
-                            self._active_process_task = None
-                            await asyncio.to_thread(self.process_task, task.payload)
+                            # 保存任务引用以便可以取消
+                            loop = asyncio.get_event_loop()
+                            self._active_process_task = loop.create_task(
+                                asyncio.to_thread(self.process_task, task.payload)
+                            )
+                            await self._active_process_task
 
                         logger.info(f"[{self.name}] 任务处理完毕。队列大小: {self._task_queue.qsize()}")
                     except asyncio.CancelledError:

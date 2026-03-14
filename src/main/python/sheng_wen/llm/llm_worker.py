@@ -176,6 +176,10 @@ class LLMWorker(Worker):
                 update_data["summary_chunk_total"] = None
                 update_data["summary_chunk_done"] = None
 
+            # Agent 模式下，等待所有待处理的分块更新完成
+            if mode_used == "agent":
+                await self._await_pending_updates(timeout=5.0)
+
             from ..task_updater import update_and_notify
             await update_and_notify(task_id, update_data)
 
@@ -340,6 +344,7 @@ class LLMWorker(Worker):
 
         last_stream_update = 0.0
         last_stream_summary = ""
+        update_in_progress = False
 
         def update_chunk_progress(done: int, total: int, partial_summary: str):
             nonlocal last_stream_summary
@@ -373,43 +378,57 @@ class LLMWorker(Worker):
             ))
             last_stream_summary = partial_summary
 
-        def update_chunk_stream(done: int, total: int, streaming_summary: str):
-            nonlocal last_stream_update, last_stream_summary
-            if not task_id or not streaming_summary:
-                return
-            from ..db import db, TaskStatus
+        async def flush_chunk_stream(done: int, total: int, streaming_summary: str):
+            """异步防抖更新函数"""
+            nonlocal last_stream_update, last_stream_summary, update_in_progress
 
-            if self.is_task_cancelled(task_id):
+            if not task_id or not streaming_summary or update_in_progress:
                 return
 
+            # 防抖：距离上次更新不足0.5秒则跳过
             now = asyncio.get_event_loop().time()
             if now - last_stream_update < 0.5:
                 return
+
             if streaming_summary == last_stream_summary:
                 return
 
-            current_task = db.get_task(task_id)
-            if not current_task:
-                return
-            current_status = str(current_task.get("status") or "")
-            if current_status != TaskStatus.SUMMARIZING.value:
-                return
+            update_in_progress = True
+            try:
+                from ..db import db, TaskStatus
+                from ..task_updater import update_and_notify
 
-            progress = int((done / total) * 100) if total > 0 else 0
-            from ..task_updater import update_and_notify
-            self._submit_coro(update_and_notify(
-                task_id,
-                {
-                    "status": TaskStatus.SUMMARIZING,
-                    "summary": streaming_summary,
-                    "progress": progress,
-                    "summary_mode": mode_value if mode_value in {"auto", "agent"} else "agent",
-                    "summary_chunk_total": total,
-                    "summary_chunk_done": done,
-                },
-            ))
-            last_stream_update = now
-            last_stream_summary = streaming_summary
+                # 只有当任务仍在 SUMMARIZING 状态时才更新
+                current_task = db.get_task(task_id)
+                if not current_task:
+                    return
+                current_status = str(current_task.get("status") or "")
+                if current_status != TaskStatus.SUMMARIZING.value:
+                    return
+
+                progress = int((done / total) * 100) if total > 0 else 0
+                await update_and_notify(
+                    task_id,
+                    {
+                        "status": TaskStatus.SUMMARIZING,
+                        "summary": streaming_summary,
+                        "progress": progress,
+                        "summary_mode": mode_value if mode_value in {"auto", "agent"} else "agent",
+                        "summary_chunk_total": total,
+                        "summary_chunk_done": done,
+                    },
+                )
+                last_stream_update = now
+                last_stream_summary = streaming_summary
+            finally:
+                update_in_progress = False
+
+        def update_chunk_stream(done: int, total: int, streaming_summary: str):
+            """同步回调函数，每次收到新内容就触发更新"""
+            if self.is_task_cancelled(task_id):
+                return
+            # 每次收到新内容就尝试更新（防抖在flush内部处理）
+            self._submit_coro(flush_chunk_stream(done, total, streaming_summary))
 
         summarizer = ChunkedSummarizer(
             llm_client=self._llm_client,

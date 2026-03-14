@@ -61,7 +61,7 @@ export const MARKDOWN_THEMES: Record<string, MarkdownTheme> = {
       '--md-code-font-size': '0.9em',
 
       // 代码块
-      '--md-pre-bg': '#f8fafc',
+      '--md-pre-bg': '#f1f5f9',
       '--md-pre-border': '#e2e8f0',
       '--md-pre-padding': '1rem',
       '--md-pre-radius': '8px',

@@ -270,6 +270,7 @@
   white-space: inherit;
   word-break: inherit;
   overflow-wrap: inherit;
+  color: #1e293b; /* 深灰色，确保代码块可读性 */
 }
 
 /* ========== 代码块的 ::before 和 ::after 伪元素 ========== */
