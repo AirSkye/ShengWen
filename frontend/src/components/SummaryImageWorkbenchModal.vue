@@ -36,6 +36,7 @@ const props = defineProps<{
   widthOptions: number[]
   pixelRatioOptions: number[]
   isPreviewRendering: boolean
+  renderProgress: { current: number; total: number } | null
   previewDirty: boolean
   canRefreshPreview: boolean
   refreshButtonLabel: string
@@ -951,7 +952,10 @@ onBeforeUnmount(() => {
             >
               <div class="flex items-center gap-3 rounded-2xl bg-white/95 backdrop-blur-sm px-6 py-4 text-base font-semibold text-slate-800 shadow-xl">
                 <PhCircleNotch :size="24" class="animate-spin text-primary" />
-                <span>成图预览生成中……</span>
+                <span v-if="renderProgress">
+                  正在生成第 {{ renderProgress.current }}/{{ renderProgress.total }} 张...
+                </span>
+                <span v-else>成图预览生成中……</span>
               </div>
             </div>
           </transition>

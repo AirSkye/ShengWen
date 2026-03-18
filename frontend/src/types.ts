@@ -135,3 +135,31 @@ export interface UpdateSummarizationSettingsRequest {
   max_agent_value_chars?: number;
   fallback_to_standard_on_agent_error?: boolean;
 }
+
+export interface BilibiliCookieFromBrowserResult {
+  success: boolean;
+  sessdata?: string;
+  sessdata_masked?: string;
+  source_browser?: string;
+  error?: string;
+}
+
+export interface BilibiliVideoPartInfo {
+  index: number;
+  cid: number;
+  title: string;
+  duration: number;
+}
+
+export interface BilibiliVideoInfo {
+  is_multi_part: boolean;
+  title: string;
+  bvid: string;
+  duration: number;
+  parts?: BilibiliVideoPartInfo[];
+}
+
+export interface BilibiliPartsConfig {
+  mode: 'merge' | 'separate';
+  indices: number[];
+}

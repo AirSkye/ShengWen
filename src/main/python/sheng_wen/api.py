@@ -223,6 +223,55 @@ class TranscriptionSettingsUpdate(BaseModel):
     )
 
 
+class BilibiliCookieFromBrowserResult(BaseModel):
+    success: bool = Field(description="是否成功读取")
+    sessdata: Optional[str] = Field(default=None, description="读取到的 SESSDATA（完整值）")
+    sessdata_masked: Optional[str] = Field(default=None, description="脱敏后的 SESSDATA")
+    source_browser: Optional[str] = Field(default=None, description="读取来源浏览器")
+    error: Optional[str] = Field(default=None, description="错误信息")
+
+
+class BilibiliVideoPartInfo(BaseModel):
+    index: int = Field(description="分P索引（0-based）")
+    cid: int = Field(description="分P的 cid")
+    title: str = Field(description="分P标题")
+    duration: int = Field(description="分P时长（秒）")
+
+
+class BilibiliVideoInfoRequest(BaseModel):
+    url: str = Field(..., description="B站视频链接")
+
+
+class BilibiliVideoInfo(BaseModel):
+    is_multi_part: bool = Field(description="是否为多P视频")
+    title: str = Field(description="视频标题")
+    bvid: str = Field(description="BV号")
+    duration: int = Field(description="视频总时长（秒）")
+    parts: Optional[List[BilibiliVideoPartInfo]] = Field(default=None, description="分P列表（仅多P视频）")
+
+
+class BilibiliPartsConfig(BaseModel):
+    mode: str = Field(description="处理模式: merge（合并）或 separate（拆分）")
+    indices: List[int] = Field(description="要处理的分P索引列表")
+
+
+class TaskCreate(BaseModel):
+    video_url: HttpUrl
+    quality: Optional[str] = "best" # "best", "audio_only"
+    summary_mode: Optional[str] = Field(
+        default=None,
+        description="总结模式: standard | agent | auto（前端建议仅 standard/agent）",
+    )
+    bilibili_sessdata: Optional[str] = Field(
+        default=None,
+        description="任务级 B 站 SESSDATA，可覆盖全局配置与环境变量",
+    )
+    bilibili_parts: Optional[BilibiliPartsConfig] = Field(
+        default=None,
+        description="B站分P处理配置（仅多P视频需要）",
+    )
+
+
 class SummarizationSettings(BaseModel):
     mode: str
     auto_chunk_min_audio_duration_sec: int
@@ -768,11 +817,123 @@ async def upload_local_path(payload: LocalPathTaskCreate, request: Request):
     await notify_task_update(task_id)
     return task_data
 
+async def _get_bilibili_video_title_and_parts(video_url: str) -> tuple[str, list]:
+    """获取 B 站视频标题和分P信息。返回 (title, parts_list)。"""
+    from bilibili_api import video, sync
+    import re
+    from urllib.request import Request, urlopen
+
+    # 解析 BV 号
+    candidate = video_url
+    if "b23.tv" in video_url:
+        try:
+            request = Request(video_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(request, timeout=15) as response:
+                candidate = response.geturl()
+        except Exception:
+            pass
+
+    match = re.search(r"/video/(BV[0-9A-Za-z]+)", candidate)
+    if not match:
+        fallback = re.search(r"(BV[0-9A-Za-z]+)", candidate)
+        if fallback:
+            bvid = fallback.group(1)
+        else:
+            return ("未知标题", [])
+    else:
+        bvid = match.group(1)
+
+    video_obj = video.Video(bvid=bvid)
+    info = sync(video_obj.get_info())
+
+    title = str(info.get("title") or "未知标题")
+    pages = info.get("pages", [])
+    parts = []
+    for page in pages:
+        if isinstance(page, dict):
+            parts.append({
+                "index": int(page.get("page", 0)) - 1,  # 0-based
+                "title": str(page.get("part") or ""),
+            })
+    return (title, parts)
+
+
 @app.post("/tasks/", response_model=Task, status_code=201)
 async def create_task(task_in: TaskCreate):
     """
     提交一个新的视频处理任务
     """
+    # 处理 B 站分P拆分模式
+    if task_in.bilibili_parts and task_in.bilibili_parts.mode == "separate":
+        # 获取视频标题和分P信息
+        try:
+            video_title, parts_info = await _get_bilibili_video_title_and_parts(str(task_in.video_url))
+        except Exception as e:
+            logger.warning(f"获取 B 站视频标题失败: {e}")
+            video_title = "未知标题"
+            parts_info = []
+
+        # 为每个选中的分P创建独立任务
+        first_task_data = None
+        for part_index in task_in.bilibili_parts.indices:
+            task_id = str(uuid.uuid4())
+            resolved_summary_mode = _normalize_summary_mode(task_in.summary_mode)
+
+            # 获取分P标题
+            part_title = ""
+            for p in parts_info:
+                if p["index"] == part_index:
+                    part_title = p["title"]
+                    break
+
+            # 构建任务标题
+            task_title = f"{video_title} - P{part_index + 1}"
+            if part_title:
+                task_title = f"{video_title} - P{part_index + 1}: {part_title}"
+
+            task_data = {
+                "id": task_id,
+                "video_url": str(task_in.video_url),
+                "status": TaskStatus.PENDING,
+                "created_at": datetime.utcnow(),
+                "latest_modified_at": datetime.utcnow(),
+                "progress": 0.0,
+                "title": task_title,
+                "author_name": None,
+                "author_url": None,
+                "summary_mode": resolved_summary_mode,
+                "summary_chunk_total": None,
+                "summary_chunk_done": None,
+                "summary_meta": None,
+            }
+            db.save_task(task_id, task_data)
+
+            worker = await _resolve_worker_or_raise(get_downloader_worker, task_id=task_id)
+            task_payload = {
+                "task_id": task_id,
+                "video_url": str(task_in.video_url),
+                "quality": task_in.quality,
+                "summary_mode": resolved_summary_mode,
+                # 传递单个分P索引，让 worker 处理该分P
+                "bilibili_parts": {
+                    "mode": "merge",  # 单个分P用 merge 模式即可
+                    "indices": [part_index],
+                },
+            }
+            task_cookie = _sanitize_cookie_value(task_in.bilibili_sessdata)
+            if task_cookie:
+                task_payload["bilibili_sessdata"] = task_cookie
+
+            await worker.add_task(task_payload)
+            await notify_task_update(task_id)
+
+            # 记录第一个任务用于返回
+            if first_task_data is None:
+                first_task_data = task_data
+
+        return first_task_data
+
+    # 普通任务或 merge 模式
     task_id = str(uuid.uuid4())
     resolved_summary_mode = _normalize_summary_mode(task_in.summary_mode)
     task_data = {
@@ -801,6 +962,14 @@ async def create_task(task_in: TaskCreate):
     task_cookie = _sanitize_cookie_value(task_in.bilibili_sessdata)
     if task_cookie:
         task_payload["bilibili_sessdata"] = task_cookie
+
+    # 添加 B 站分P处理配置（merge 模式或单P视频）
+    if task_in.bilibili_parts:
+        task_payload["bilibili_parts"] = {
+            "mode": task_in.bilibili_parts.mode,
+            "indices": task_in.bilibili_parts.indices,
+        }
+
     await worker.add_task(task_payload)
 
     await notify_task_update(task_id)
@@ -1213,6 +1382,100 @@ async def update_transcription_settings(payload: TranscriptionSettingsUpdate):
         return settings
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/bilibili/video-info", response_model=BilibiliVideoInfo)
+async def get_bilibili_video_info(payload: BilibiliVideoInfoRequest):
+    """获取 B 站视频信息，包括是否为多P视频及分P列表。"""
+    video_url = str(payload.url or "").strip()
+    if not video_url:
+        raise HTTPException(status_code=400, detail="URL 不能为空")
+
+    if not _is_bilibili_video_url(video_url):
+        raise HTTPException(status_code=400, detail="不是有效的 B 站视频链接")
+
+    try:
+        from bilibili_api import video, sync
+        import re
+        from urllib.request import Request, urlopen
+
+        # 解析 BV 号
+        candidate = video_url
+        if "b23.tv" in video_url:
+            try:
+                request = Request(video_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urlopen(request, timeout=15) as response:
+                    candidate = response.geturl()
+            except Exception:
+                pass
+
+        match = re.search(r"/video/(BV[0-9A-Za-z]+)", candidate)
+        if not match:
+            fallback = re.search(r"(BV[0-9A-Za-z]+)", candidate)
+            if fallback:
+                bvid = fallback.group(1)
+            else:
+                raise HTTPException(status_code=400, detail="无法从链接中提取 BV 号")
+        else:
+            bvid = match.group(1)
+
+        # 获取视频信息
+        video_obj = video.Video(bvid=bvid)
+        info = sync(video_obj.get_info())
+
+        title = str(info.get("title") or "")
+        duration = int(info.get("duration") or 0)
+
+        # 检查是否为多P视频
+        pages = info.get("pages")
+        if isinstance(pages, list) and len(pages) > 1:
+            # 多P视频
+            parts = []
+            for page in pages:
+                if not isinstance(page, dict):
+                    continue
+                part_index = int(page.get("page", 0))
+                cid = int(page.get("cid", 0))
+                part_title = str(page.get("part") or f"第{part_index}P")
+                part_duration = int(page.get("duration") or 0)
+                parts.append(BilibiliVideoPartInfo(
+                    index=part_index - 1,  # 转换为 0-based
+                    cid=cid,
+                    title=part_title,
+                    duration=part_duration,
+                ))
+
+            return BilibiliVideoInfo(
+                is_multi_part=True,
+                title=title,
+                bvid=bvid,
+                duration=duration,
+                parts=parts,
+            )
+        else:
+            # 单P视频
+            return BilibiliVideoInfo(
+                is_multi_part=False,
+                title=title,
+                bvid=bvid,
+                duration=duration,
+                parts=None,
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"获取 B 站视频信息失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"获取视频信息失败: {str(e)}")
+
+
+@app.post("/transcription/settings/bilibili-cookie/from-browser", response_model=BilibiliCookieFromBrowserResult)
+async def read_bilibili_cookie_from_browser():
+    """从浏览器读取 B 站 SESSDATA 并保存到全局配置。"""
+    result = transcription_settings_manager.read_cookie_from_browser()
+    if result["success"]:
+        config_manager.save_transcription_config(transcription_settings_manager.get_runtime_state())
+    return result
 
 
 @app.get("/summarization/settings", response_model=SummarizationSettings)

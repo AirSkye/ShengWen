@@ -12,11 +12,12 @@ import {
   type SummaryImageLayoutPreset,
   type SummaryImageFormat,
   type SummaryImageMetaMode,
+  type SummaryImageRenderProgress,
 } from './composables/useSummaryImageExporter'
 import { useToast } from './composables/useToast'
 import { stripDoubleBracePlaceholders } from './utils/formatters'
 import { postProcessCompiledMarkdown } from './utils/markdownPostProcessor'
-import type { Task, MarkdownHeadingItem } from './types'
+import type { Task, MarkdownHeadingItem, BilibiliVideoInfo, BilibiliPartsConfig } from './types'
 import Sidebar from './components/Sidebar.vue'
 import FloatingToolbar from './components/FloatingToolbar.vue'
 import TaskInfoModal from './components/TaskInfoModal.vue'
@@ -24,6 +25,7 @@ import TaskContentArea from './components/TaskContentArea.vue'
 import MermaidViewerModal from './components/MermaidViewerModal.vue'
 import SummaryImageWorkbenchModal from './components/SummaryImageWorkbenchModal.vue'
 import SettingsModal from './components/SettingsModal.vue'
+import BilibiliPartsSelector from './components/BilibiliPartsSelector.vue'
 import ToastContainer from './components/ToastContainer.vue'
 
 const {
@@ -45,6 +47,7 @@ const {
   isUpdatingTranscriptionSettings,
   summarizationSettings,
   isUpdatingSummarizationSettings,
+  isReadingBilibiliCookieFromBrowser,
   submitTask,
   cancelSubmitting,
   selectTask,
@@ -58,7 +61,11 @@ const {
   updateLlmSettings,
   updateTranscriptionSettings,
   updateSummarizationSettings,
-  testLlm
+  testLlm,
+  readBilibiliCookieFromBrowser,
+  checkBilibiliVideoInfo,
+  submitTaskWithParts,
+  isBilibiliUrl
 } = useTaskViewModel()
 
 // 状态变量
@@ -77,6 +84,12 @@ const markdownHeadings = ref<MarkdownHeadingItem[]>([])
 const activeHeadingId = ref('')
 const headingJumpRequest = ref<{ id: string; requestId: number } | null>(null)
 const headingJumpSeq = ref(0)
+
+// B站分P选择器状态
+const isBilibiliPartsSelectorOpen = ref(false)
+const bilibiliVideoInfo = ref<BilibiliVideoInfo | null>(null)
+const isCheckingBilibiliVideoInfo = ref(false)
+const pendingBilibiliUrl = ref('')
 
 // Mermaid 查看器
 const mermaidViewerModalRef = ref<{
@@ -149,6 +162,7 @@ const loadSummaryImageSettings = (): SummaryImageExportSettings => {
 const summaryImageSettings = ref<SummaryImageExportSettings>(loadSummaryImageSettings())
 const isSummaryImageSettingsOpen = ref(false)
 const isSummaryPreviewRendering = ref(false)
+const summaryRenderProgress = ref<{ current: number; total: number } | null>(null)
 const summaryPreviewDirty = ref(true)
 const summaryPreviewPages = ref<SummaryImagePreviewPage[]>([])
 const summaryPreviewActiveIndex = ref(0)
@@ -194,12 +208,22 @@ const refreshSummaryImagePreview = async (options?: { manual?: boolean; force?: 
 
   const currentSequence = ++summaryPreviewSequence
   isSummaryPreviewRendering.value = true
+  summaryRenderProgress.value = null
+  summaryPreviewPages.value = []
 
   try {
-    const preview = await generateSummaryImagePreview(payload, summaryImageSettings.value)
+    const preview = await generateSummaryImagePreview(
+      payload,
+      summaryImageSettings.value,
+      (progress: SummaryImageRenderProgress) => {
+        summaryRenderProgress.value = { current: progress.current, total: progress.total }
+        if (progress.page) {
+          summaryPreviewPages.value = [...summaryPreviewPages.value, progress.page]
+        }
+      },
+    )
     if (currentSequence !== summaryPreviewSequence) return
 
-    summaryPreviewPages.value = preview.pages
     summaryPreviewTotalSizeKB.value = preview.totalSizeKB
     summaryPreviewActiveIndex.value = Math.min(
       summaryPreviewActiveIndex.value,
@@ -217,6 +241,7 @@ const refreshSummaryImagePreview = async (options?: { manual?: boolean; force?: 
   } finally {
     if (currentSequence === summaryPreviewSequence) {
       isSummaryPreviewRendering.value = false
+      summaryRenderProgress.value = null
     }
   }
 }
@@ -409,6 +434,85 @@ const handleUpdateTranscriptionSettings = async (payload: {
   }
 }
 
+const handleReadBilibiliCookieFromBrowser = async () => {
+  try {
+    const result = await readBilibiliCookieFromBrowser()
+    if (result.success) {
+      success(`已从 ${result.source_browser} 读取 Cookie`)
+    } else {
+      toastError(result.error || '读取失败')
+    }
+  } catch (_e) {
+    // 错误信息由 useTaskViewModel + Toast 统一处理
+  }
+}
+
+// B站分P处理
+const handleSubmit = async () => {
+  // localhost 场景优先使用本地路径直读（避免文件上传复制）
+  if (isLocalClient && localFilePath.value.trim()) {
+    await submitTask()
+    return
+  }
+
+  // 文件上传
+  if (selectedFile.value) {
+    await submitTask()
+    return
+  }
+
+  // URL 提交 - 检查是否为B站多P视频
+  const url = videoUrl.value.trim()
+  if (!url) {
+    error.value = '请输入有效视频链接，或粘贴包含链接的文本。'
+    return
+  }
+
+  if (isBilibiliUrl(url)) {
+    // 检查是否为多P视频
+    isCheckingBilibiliVideoInfo.value = true
+    pendingBilibiliUrl.value = url
+    try {
+      const info = await checkBilibiliVideoInfo(url)
+      if (info && info.is_multi_part) {
+        // 是多P视频，显示选择器
+        bilibiliVideoInfo.value = info
+        isBilibiliPartsSelectorOpen.value = true
+        isSubmitting.value = false
+      } else {
+        // 单P视频，直接提交
+        await submitTask()
+      }
+    } catch (err) {
+      // 检查失败，直接提交（后端会处理）
+      console.error('Failed to check Bilibili video info:', err)
+      await submitTask()
+    } finally {
+      isCheckingBilibiliVideoInfo.value = false
+    }
+  } else {
+    // 非B站视频，直接提交
+    await submitTask()
+  }
+}
+
+const handleBilibiliPartsConfirm = async (config: BilibiliPartsConfig) => {
+  isBilibiliPartsSelectorOpen.value = false
+  try {
+    await submitTaskWithParts(pendingBilibiliUrl.value, config)
+    videoUrl.value = ''
+    success('已提交任务')
+  } catch (_e) {
+    // 错误信息由 useTaskViewModel + Toast 统一处理
+  }
+}
+
+const handleBilibiliPartsClose = () => {
+  isBilibiliPartsSelectorOpen.value = false
+  bilibiliVideoInfo.value = null
+  pendingBilibiliUrl.value = ''
+}
+
 const startEditingTopic = () => {
   editingTopicValue.value = topic.value || selectedTask.value?.title || ''
   isEditingTopic.value = true
@@ -570,11 +674,13 @@ watch(
       :isUpdatingTranscriptionSettings="isUpdatingTranscriptionSettings"
       :summarizationSettings="summarizationSettings"
       :isUpdatingSummarizationSettings="isUpdatingSummarizationSettings"
+      :isReadingBilibiliCookieFromBrowser="isReadingBilibiliCookieFromBrowser"
       @close="isSettingsModalOpen = false"
       @updateLlmSettings="handleUpdateLlmSettings"
       @updateLlmSettingsAndTest="handleUpdateLlmSettingsAndTest"
       @testLlm="handleTestLlm"
       @updateTranscriptionSettings="handleUpdateTranscriptionSettings"
+      @readBilibiliCookieFromBrowser="handleReadBilibiliCookieFromBrowser"
       @updateSummarizationSettings="handleUpdateSummarizationSettings"
     />
 
@@ -603,7 +709,7 @@ watch(
       :isUpdatingTranscriptionSettings="isUpdatingTranscriptionSettings"
       :summarizationSettings="summarizationSettings"
       :isUpdatingSummarizationSettings="isUpdatingSummarizationSettings"
-      @submit="submitTask"
+      @submit="handleSubmit"
       @cancelSubmit="cancelSubmitting"
       @selectTask="handleSelectTask"
       @deleteTask="handleDeleteTask"
@@ -703,6 +809,7 @@ watch(
       :width-options="summaryWidthOptions"
       :pixel-ratio-options="summaryPixelRatioOptions"
       :is-preview-rendering="isSummaryPreviewRendering"
+      :render-progress="summaryRenderProgress"
       :preview-dirty="summaryPreviewDirty"
       :can-refresh-preview="canRefreshSummaryPreview"
       :refresh-button-label="summaryRefreshButtonLabel"
@@ -715,6 +822,15 @@ watch(
       @preview-prev="handlePreviewPagePrev"
       @preview-next="handlePreviewPageNext"
       @select-preview-page="handleSelectPreviewPage"
+    />
+
+    <!-- B站分P选择器 -->
+    <BilibiliPartsSelector
+      :isOpen="isBilibiliPartsSelectorOpen"
+      :videoInfo="bilibiliVideoInfo"
+      :isLoading="isCheckingBilibiliVideoInfo"
+      @close="handleBilibiliPartsClose"
+      @confirm="handleBilibiliPartsConfirm"
     />
   </div>
 </template>

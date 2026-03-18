@@ -52,6 +52,14 @@ export interface SummaryImagePreviewResult {
   format: SummaryImageFormat
 }
 
+export interface SummaryImageRenderProgress {
+  current: number
+  total: number
+  page: SummaryImagePreviewPage | null
+}
+
+export type SummaryImageProgressCallback = (progress: SummaryImageRenderProgress) => void
+
 export interface SummaryImageExportPageResult {
   index: number
   filename: string
@@ -1184,6 +1192,7 @@ export function useSummaryImageExporter() {
   const generateSummaryImagePreview = async (
     payload: SummaryImageExportPayload,
     customSettings?: Partial<SummaryImageExportSettings>,
+    onProgress?: SummaryImageProgressCallback,
   ): Promise<SummaryImagePreviewResult> => {
     const normalized = normalizeSettings(customSettings)
     const previewSettings: SummaryImageExportSettings = {
@@ -1198,20 +1207,31 @@ export function useSummaryImageExporter() {
     }
     const pages: SummaryImagePreviewPage[] = []
     let totalBytes = 0
+    const total = canvases.length
 
     for (const [index, canvas] of canvases.entries()) {
+      if (onProgress) {
+        onProgress({ current: index + 1, total, page: null })
+      }
+
       const { blob } = await encodeCanvasBySettings(canvas, normalized, true)
       const dataUrl = await blobToDataUrl(blob)
       totalBytes += blob.size
 
-      pages.push({
+      const page: SummaryImagePreviewPage = {
         index,
         dataUrl,
         width: canvas.width,
         height: canvas.height,
         sizeKB: Math.round(blob.size / 1024),
         format: normalized.format,
-      })
+      }
+
+      pages.push(page)
+
+      if (onProgress) {
+        onProgress({ current: index + 1, total, page })
+      }
     }
 
     return {

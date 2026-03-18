@@ -10,6 +10,52 @@ from typing import Any, Literal
 from ..utils.logger import logger
 from .transcriber import get_transcriber
 
+
+def _read_bilibili_cookie_from_browser() -> tuple[str, str]:
+    """
+    尝试从浏览器中读取 B 站 SESSDATA。
+
+    Returns:
+        tuple[str, str]: (sessdata, browser_name) 或 ("", "") 如果未找到
+    """
+    browsers_to_try = [
+        ("edge", "Microsoft Edge"),
+        ("chrome", "Google Chrome"),
+        ("firefox", "Firefox"),
+        ("chromium", "Chromium"),
+        ("opera", "Opera"),
+        ("brave", "Brave"),
+    ]
+
+    try:
+        import browser_cookie3  # type: ignore
+    except ImportError:
+        logger.warning("[TranscriptionSettingsManager] browser_cookie3 未安装，无法从浏览器读取 Cookie")
+        return "", ""
+
+    for browser_key, browser_name in browsers_to_try:
+        try:
+            browser_func = getattr(browser_cookie3, browser_key, None)
+            if browser_func is None:
+                continue
+
+            cookies = browser_func(domain_name="bilibili.com")
+            for cookie in cookies:
+                if cookie.name == "SESSDATA" and cookie.value:
+                    sessdata = _sanitize_cookie_value(cookie.value)
+                    if sessdata:
+                        logger.info(f"[TranscriptionSettingsManager] 成功从 {browser_name} 读取 B 站 Cookie")
+                        return sessdata, browser_name
+        except PermissionError:
+            # 浏览器正在运行时会触发此错误，跳过该浏览器
+            logger.debug(f"[TranscriptionSettingsManager] {browser_name} 正在运行，跳过读取")
+            continue
+        except Exception as e:
+            logger.debug(f"[TranscriptionSettingsManager] 从 {browser_name} 读取失败: {e}")
+            continue
+
+    return "", ""
+
 _CUDA_DLL_PATTERN = re.compile(
     r"(cublas(?:Lt)?64_(\d+)\.dll|cudart64_(\d+)\.dll|cudnn64(?:_\d+)?\.dll)",
     re.IGNORECASE,
@@ -455,6 +501,34 @@ class TranscriptionSettingsManager:
                 )
 
         return self.get_settings()
+
+    def read_cookie_from_browser(self) -> dict[str, Any]:
+        """
+        从浏览器读取 B 站 SESSDATA 并保存到全局配置。
+
+        Returns:
+            dict: 包含 success, sessdata (脱敏), sessdata_masked, source_browser, error 等字段
+        """
+        sessdata, browser_name = _read_bilibili_cookie_from_browser()
+
+        if not sessdata:
+            return {
+                "success": False,
+                "error": "未在任何浏览器中找到 B 站登录态。请确保已在浏览器中登录 bilibili.com，或关闭浏览器后重试。",
+            }
+
+        with self._lock:
+            self._bilibili_sessdata = sessdata
+            logger.info(
+                f"[TranscriptionSettingsManager] 已从 {browser_name} 读取并保存 B 站 SESSDATA"
+            )
+
+        return {
+            "success": True,
+            "sessdata": sessdata,
+            "sessdata_masked": _mask_cookie_value(sessdata),
+            "source_browser": browser_name,
+        }
 
     def get_runtime_state(self) -> dict[str, Any]:
         with self._lock:

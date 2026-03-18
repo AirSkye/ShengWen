@@ -22,6 +22,7 @@ const props = defineProps<{
   isUpdatingTranscriptionSettings: boolean
   summarizationSettings: SummarizationSettings | null
   isUpdatingSummarizationSettings: boolean
+  isReadingBilibiliCookieFromBrowser: boolean
 }>()
 
 const emit = defineEmits<{
@@ -50,6 +51,7 @@ const emit = defineEmits<{
     bilibili_sessdata?: string
     clear_bilibili_sessdata?: boolean
   }]
+  readBilibiliCookieFromBrowser: []
   updateSummarizationSettings: [payload: {
     chunk_target_duration_sec?: number
     chunk_min_duration_sec?: number
@@ -228,6 +230,10 @@ const clearGlobalBilibiliSessdata = () => {
   emit('updateTranscriptionSettings', { clear_bilibili_sessdata: true })
 }
 
+const handleReadBilibiliCookieFromBrowser = () => {
+  emit('readBilibiliCookieFromBrowser')
+}
+
 const handleSaveSummarizationSettings = () => {
   emit('updateSummarizationSettings', {
     chunk_target_duration_sec: minutesToSeconds(chunkTargetDurationSec.value),
@@ -254,10 +260,6 @@ const handleSaveSummarizationSettings = () => {
       <div class="bg-white rounded-2xl shadow-2xl w-full max-w-4xl h-[85vh] flex flex-col md:flex-row overflow-hidden">
         <!-- 左侧导航栏 (桌面端) / 顶部导航 (移动端) -->
         <div class="md:w-48 shrink-0 bg-slate-50 border-b md:border-b-0 md:border-r border-slate-200 flex md:flex-col py-3 md:py-6 overflow-x-auto md:overflow-x-visible">
-          <div class="hidden md:block px-4 mb-6">
-            <h2 class="text-lg font-semibold text-slate-800">系统设置</h2>
-          </div>
-
           <nav class="flex md:flex-col flex-1 px-3 gap-1 md:space-y-1 min-w-max md:min-w-0">
             <button
               @click="settingsTab = 'llm'"
@@ -298,21 +300,22 @@ const handleSaveSummarizationSettings = () => {
               <span>Agent 设置</span>
             </button>
           </nav>
-
-          <!-- 关闭按钮 (桌面端) -->
-          <div class="hidden md:block px-3 pt-4 border-t border-slate-200">
-            <button
-              @click="emit('close')"
-              class="w-full flex items-center justify-center gap-2 px-3 py-2.5 text-slate-600 hover:bg-white/50 hover:text-slate-800 rounded-lg text-sm font-medium transition-colors"
-            >
-              <PhX :size="18" />
-              <span>关闭</span>
-            </button>
-          </div>
         </div>
 
         <!-- 右侧内容区 -->
         <div class="flex-1 flex flex-col min-w-0 min-h-0">
+          <!-- 头部栏 (仅桌面端) -->
+          <div class="hidden md:flex items-center justify-between px-6 py-4 border-b border-slate-200 bg-white">
+            <h2 class="text-lg font-semibold text-slate-800">
+              {{ settingsTab === 'llm' ? 'LLM 配置' : settingsTab === 'transcription' ? '转录设置' : 'Agent 设置' }}
+            </h2>
+            <button
+              @click="emit('close')"
+              class="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-colors"
+            >
+              <PhX :size="20" />
+            </button>
+          </div>
           <!-- 内容区 -->
           <div class="flex-1 overflow-y-auto px-4 md:px-6 py-4 md:py-6 custom-scrollbar min-h-0">
             <!-- LLM 设置 -->
@@ -619,13 +622,26 @@ const handleSaveSummarizationSettings = () => {
                   class="w-full pl-10 pr-3 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
                 >
               </div>
-              <button
-                @click="clearGlobalBilibiliSessdata"
-                :disabled="isUpdatingTranscriptionSettings || !transcriptionSettings?.has_bilibili_sessdata"
-                class="w-full bg-white hover:bg-slate-50 text-slate-600 py-2 rounded-xl text-xs font-medium border border-slate-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                清空已保存 Cookie
-              </button>
+              <p class="text-xs text-amber-600 mt-1">
+                提示：如果填写 SESSDATA 后依然获取字幕不成功，请尝试在对应浏览器重新登录或手动复制 SESSDATA。
+              </p>
+              <div class="grid grid-cols-2 gap-2">
+                <button
+                  @click="handleReadBilibiliCookieFromBrowser"
+                  :disabled="isReadingBilibiliCookieFromBrowser || isUpdatingTranscriptionSettings"
+                  class="flex items-center justify-center gap-2 bg-white hover:bg-slate-50 text-slate-600 py-2 rounded-xl text-xs font-medium border border-slate-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <PhSpinner v-if="isReadingBilibiliCookieFromBrowser" :size="14" class="animate-spin" />
+                  <span>{{ isReadingBilibiliCookieFromBrowser ? '读取中...' : '从浏览器读取' }}</span>
+                </button>
+                <button
+                  @click="clearGlobalBilibiliSessdata"
+                  :disabled="isUpdatingTranscriptionSettings || !transcriptionSettings?.has_bilibili_sessdata"
+                  class="bg-white hover:bg-slate-50 text-slate-600 py-2 rounded-xl text-xs font-medium border border-slate-200 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  清空已保存 Cookie
+                </button>
+              </div>
             </div>
             </div>
 

@@ -2,9 +2,10 @@ import asyncio
 import json
 import os
 import re
+import uuid
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 import yt_dlp
 
 from ..worker import Worker, TaskCancelledError
@@ -214,7 +215,20 @@ class VideoDownloaderWorker(Worker):
 
         return ""
 
-    async def _extract_bilibili_subtitle_via_api(self, video_url: str, sessdata: str) -> Dict[str, Any] | None:
+    async def _extract_bilibili_subtitle_via_api(
+        self, video_url: str, sessdata: str, part_index: int = 0
+    ) -> Dict[str, Any] | None:
+        """
+        提取 B 站视频字幕。
+
+        Args:
+            video_url: 视频链接
+            sessdata: B 站 Cookie
+            part_index: 分P索引（0-based），默认为0（第一个分P或单P视频）
+
+        Returns:
+            包含字幕信息的字典，或 None 如果获取失败
+        """
         try:
             from bilibili_api import Credential, video
         except Exception as exc:
@@ -225,7 +239,7 @@ class VideoDownloaderWorker(Worker):
 
         video_obj = video.Video(bvid=bvid, credential=credential)
         info = await video_obj.get_info()
-        cid = await video_obj.get_cid(0)
+        cid = await video_obj.get_cid(part_index)
         player_info = await video_obj.get_player_info(cid=cid)
 
         subtitle_block = player_info.get("subtitle") if isinstance(player_info, dict) else None
@@ -248,17 +262,127 @@ class VideoDownloaderWorker(Worker):
             return None
 
         language = str(selected.get("lan") or selected.get("lang") or "")
+
+        # 获取该分P的具体信息
+        part_title = None
+        part_duration = None
+        pages = info.get("pages")
+        if isinstance(pages, list) and len(pages) > part_index:
+            page_info = pages[part_index]
+            if isinstance(page_info, dict):
+                part_title = page_info.get("part")
+                part_duration = page_info.get("duration")
+
         return {
             "title": info.get("title"),
-            "duration": info.get("duration"),
+            "duration": part_duration or info.get("duration"),
             "transcript": transcript,
             "language": language,
             "is_auto": "ai" in language.lower(),
             "subtitle_url": subtitle_url,
+            "part_index": part_index,
+            "part_title": part_title,
         }
 
+    async def _extract_bilibili_multi_part_subtitles(
+        self, video_url: str, sessdata: str, part_indices: List[int]
+    ) -> List[Dict[str, Any]]:
+        """
+        提取多个分P的字幕。
+
+        Args:
+            video_url: 视频链接
+            sessdata: B 站 Cookie
+            part_indices: 要提取的分P索引列表（0-based）
+
+        Returns:
+            成功提取的字幕信息列表
+        """
+        results = []
+        for idx in part_indices:
+            try:
+                result = await self._extract_bilibili_subtitle_via_api(video_url, sessdata, idx)
+                if result:
+                    results.append(result)
+                    logger.info(
+                        f"[{self.name}] 成功提取分P {idx + 1} 字幕: "
+                        f"{result.get('part_title') or f'第{idx + 1}P'}"
+                    )
+                else:
+                    logger.warning(f"[{self.name}] 分P {idx + 1} 未找到字幕")
+            except Exception as e:
+                logger.warning(f"[{self.name}] 提取分P {idx + 1} 字幕失败: {e}")
+        return results
+
+    def _merge_transcripts_with_offset(
+        self, subtitle_results: List[Dict[str, Any]], video_info: Dict[str, Any]
+    ) -> Tuple[str, int]:
+        """
+        合并多个分P的字幕，计算时间偏移。
+
+        Args:
+            subtitle_results: 多个分P的字幕结果列表
+            video_info: 视频信息，包含分P时长
+
+        Returns:
+            (合并后的转录文本, 总时长)
+        """
+        if not subtitle_results:
+            return "", 0
+
+        # 按分P索引排序
+        sorted_results = sorted(subtitle_results, key=lambda x: x.get("part_index", 0))
+
+        # 获取每个分P的时长用于计算偏移
+        pages = video_info.get("pages", [])
+        duration_map = {}
+        for page in pages:
+            if isinstance(page, dict):
+                page_idx = page.get("page", 1) - 1  # page 是 1-based
+                duration_map[page_idx] = page.get("duration", 0)
+
+        merged_lines = []
+        total_duration = 0
+        time_offset = 0.0
+
+        for result in sorted_results:
+            part_idx = result.get("part_index", 0)
+            transcript = result.get("transcript", "")
+
+            # 获取该分P时长
+            part_duration = duration_map.get(part_idx, result.get("duration", 0))
+            total_duration += part_duration
+
+            if time_offset > 0 and transcript:
+                # 需要调整时间戳
+                for line in transcript.split("\n"):
+                    if not line.strip():
+                        continue
+                    # 解析 HHMMSS 格式的时间戳
+                    match = re.match(r"^(\d{2})(\d{2})(\d{2})(.+)$", line)
+                    if match:
+                        h, m, s, text = int(match.group(1)), int(match.group(2)), int(match.group(3)), match.group(4)
+                        original_seconds = h * 3600 + m * 60 + s
+                        new_seconds = original_seconds + time_offset
+
+                        new_h = int(new_seconds // 3600)
+                        new_m = int((new_seconds % 3600) // 60)
+                        new_s = int(new_seconds % 60)
+                        merged_lines.append(f"{new_h:02d}{new_m:02d}{new_s:02d}{text}\n")
+                    else:
+                        merged_lines.append(line + "\n")
+            else:
+                merged_lines.append(transcript)
+                if not transcript.endswith("\n"):
+                    merged_lines.append("\n")
+
+            # 更新时间偏移
+            time_offset += part_duration
+
+        return "".join(merged_lines), total_duration
+
     def _try_extract_bilibili_subtitle(self, video_url: str, sessdata: str) -> Dict[str, Any] | None:
-        return asyncio.run(self._extract_bilibili_subtitle_via_api(video_url, sessdata))
+        return asyncio.run(self._extract_bilibili_subtitle_via_api(video_url, sessdata, 0))
 
     def _try_process_with_bilibili_subtitle(self, payload: Dict[str, Any]) -> bool:
         video_url = str(payload.get("video_url") or "")
@@ -283,6 +407,22 @@ class VideoDownloaderWorker(Worker):
                 return False
 
         sessdata, cookie_source = self._resolve_bilibili_sessdata(payload)
+
+        # 检查是否有分P配置
+        bilibili_parts = payload.get("bilibili_parts")
+        if bilibili_parts and isinstance(bilibili_parts, dict):
+            mode = bilibili_parts.get("mode")
+            indices = bilibili_parts.get("indices")
+
+            if mode == "merge" and isinstance(indices, list) and len(indices) > 0:
+                # 合并模式：提取多个分P的字幕并合并
+                return self._try_process_bilibili_multi_part_merge(
+                    video_url, sessdata, task_id, indices, payload
+                )
+            # separate 模式由 API 层处理，这里不应该到达
+            # 如果到达这里，说明配置有问题，回退到普通处理
+            logger.warning(f"[{self.name}] 未知的分P处理模式或无效配置: {bilibili_parts}")
+
         logger.info(
             f"[{self.name}] 检测到 B 站 URL，尝试使用 bilibili-api 直取字幕: {video_url}"
             f" (cookie_source={cookie_source}, has_cookie={bool(sessdata)})"
@@ -339,6 +479,97 @@ class VideoDownloaderWorker(Worker):
             return True
         except Exception as e:
             logger.warning(f"[{self.name}] B 站字幕直取失败，将回退 ASR: {e}")
+            return False
+
+    def _try_process_bilibili_multi_part_merge(
+        self, video_url: str, sessdata: str, task_id: str, part_indices: List[int], payload: Dict[str, Any]
+    ) -> bool:
+        """
+        处理多P视频合并模式：提取所有选中分P的字幕并合并为一个转录。
+        """
+        logger.info(
+            f"[{self.name}] 处理多P视频合并模式: {video_url}, 分P: {[i + 1 for i in part_indices]}"
+        )
+
+        try:
+            # 获取视频信息和所有分P字幕
+            subtitle_results = asyncio.run(
+                self._extract_bilibili_multi_part_subtitles(video_url, sessdata, part_indices)
+            )
+
+            if not subtitle_results:
+                logger.warning(f"[{self.name}] 未能获取任何分P字幕，回退到下载+ASR流程")
+                return False
+
+            # 获取视频信息用于时长计算
+            from bilibili_api import Credential, video
+            bvid = self._extract_bvid_from_url(video_url)
+            credential = Credential(sessdata=sessdata or None) if sessdata else None
+            video_obj = video.Video(bvid=bvid, credential=credential)
+            video_info = asyncio.run(video_obj.get_info())
+
+            # 合并字幕
+            merged_transcript, total_duration = self._merge_transcripts_with_offset(
+                subtitle_results, video_info
+            )
+
+            if not merged_transcript.strip():
+                logger.warning(f"[{self.name}] 合并后的字幕为空，回退到下载+ASR流程")
+                return False
+
+            # 构建标题（包含分P信息）
+            title = video_info.get("title", "")
+            if len(subtitle_results) < len(part_indices):
+                title_suffix = f" (已合并 {len(subtitle_results)}/{len(part_indices)} 个分P)"
+            else:
+                title_suffix = f" (已合并 {len(part_indices)} 个分P)"
+
+            intermediate_file_path = os.path.join(self.output_dir, f"{task_id}_subtitle.txt")
+            output_file = os.path.join(self.output_dir, f"{task_id}_summary.md")
+
+            with open(intermediate_file_path, "w", encoding="utf-8", errors="replace") as f:
+                f.write(merged_transcript)
+
+            from ..db import TaskStatus
+            from ..task_updater import update_and_notify
+            self._submit_coro(update_and_notify(task_id, {"status": TaskStatus.TRANSCRIBING}))
+
+            if self.is_task_cancelled(task_id):
+                raise TaskCancelledError(f"任务已取消，停止字幕分支: {task_id}")
+
+            update_data = {
+                "title": title + title_suffix,
+                "status": TaskStatus.SUMMARIZING,
+                "progress": 0.0,
+                "transcript": merged_transcript,
+                "transcription_time": 0.0,
+                "audio_duration": total_duration,
+                "summary_chunk_total": None,
+                "summary_chunk_done": None,
+                "summary_meta": None,
+            }
+            summary_mode = str(payload.get("summary_mode") or "").strip().lower()
+            if summary_mode in {"auto", "standard", "agent"}:
+                update_data["summary_mode"] = summary_mode
+            self._submit_coro(update_and_notify(task_id, update_data))
+
+            next_payload = payload.copy()
+            next_payload.update({
+                "intermediate_file_path": intermediate_file_path,
+                "output_file": output_file,
+            })
+            if self.is_task_cancelled(task_id):
+                raise TaskCancelledError(f"任务已取消，停止派发总结: {task_id}")
+            self._submit_coro(self.summary_worker.add_task(next_payload))
+
+            logger.info(
+                f"[{self.name}] 已合并 {len(subtitle_results)} 个分P的字幕，"
+                f"总时长 {total_duration} 秒，跳过音频转录。"
+            )
+            return True
+
+        except Exception as e:
+            logger.error(f"[{self.name}] 处理多P视频合并失败: {e}", exc_info=True)
             return False
 
     async def _resolve_and_save_bilibili_author(self, task_id: str, video_url: str):

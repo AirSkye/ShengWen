@@ -10,7 +10,10 @@ import type {
   TranscriptionSettings,
   UpdateTranscriptionSettingsRequest,
   SummarizationSettings,
-  UpdateSummarizationSettingsRequest
+  UpdateSummarizationSettingsRequest,
+  BilibiliCookieFromBrowserResult,
+  BilibiliVideoInfo,
+  BilibiliPartsConfig
 } from '../types'
 
 // 传统复制方法（兼容非安全上下文，如局域网 HTTP）
@@ -68,6 +71,15 @@ const extractFirstUrl = (raw: string): string | null => {
     return new URL(candidate).toString()
   } catch {
     return null
+  }
+}
+
+const isBilibiliUrl = (url: string): boolean => {
+  try {
+    const hostname = new URL(url).hostname.toLowerCase()
+    return hostname.includes('bilibili.com') || hostname.includes('b23.tv')
+  } catch {
+    return false
   }
 }
 
@@ -137,6 +149,7 @@ export function useTaskViewModel() {
   const isUpdatingTranscriptionSettings = ref(false)
   const summarizationSettings = ref<SummarizationSettings | null>(null)
   const isUpdatingSummarizationSettings = ref(false)
+  const isReadingBilibiliCookieFromBrowser = ref(false)
 
   let ws: WebSocket | null = null
   let submitAbortController: AbortController | null = null
@@ -488,6 +501,74 @@ export function useTaskViewModel() {
     }
   }
 
+  const readBilibiliCookieFromBrowser = async (): Promise<BilibiliCookieFromBrowserResult> => {
+    isReadingBilibiliCookieFromBrowser.value = true
+    try {
+      const response = await axios.post(`${apiBaseUrl}/transcription/settings/bilibili-cookie/from-browser`)
+      const result = response.data as BilibiliCookieFromBrowserResult
+      if (result.success) {
+        // Refresh transcription settings to reflect the new cookie
+        await fetchTranscriptionSettings()
+      }
+      return result
+    } catch (err) {
+      console.error('Failed to read Bilibili cookie from browser:', err)
+      if (axios.isAxiosError(err) && err.response) {
+        error.value = err.response.data?.detail || '从浏览器读取 Cookie 失败'
+      } else {
+        error.value = '从浏览器读取 Cookie 失败'
+      }
+      throw err
+    } finally {
+      isReadingBilibiliCookieFromBrowser.value = false
+    }
+  }
+
+  const checkBilibiliVideoInfo = async (url: string): Promise<BilibiliVideoInfo | null> => {
+    try {
+      const response = await axios.post(`${apiBaseUrl}/bilibili/video-info`, { url })
+      return response.data as BilibiliVideoInfo
+    } catch (err) {
+      console.error('Failed to check Bilibili video info:', err)
+      return null
+    }
+  }
+
+  const submitTaskWithParts = async (
+    videoUrl: string,
+    partsConfig: BilibiliPartsConfig,
+    abortSignal?: AbortSignal
+  ): Promise<void> => {
+    const controller = new AbortController()
+    submitAbortController = controller
+    isSubmitting.value = true
+    error.value = null
+
+    try {
+      const payload = {
+        video_url: videoUrl,
+        quality: quality.value,
+        summary_mode: summaryMode.value,
+        bilibili_parts: partsConfig,
+      }
+      await axios.post(`${apiBaseUrl}/tasks/`, payload, {
+        signal: abortSignal || controller.signal
+      })
+    } catch (err) {
+      if (isCanceledRequest(err)) {
+        return
+      }
+      console.error('Failed to submit task with parts:', err)
+      error.value = getAxiosErrorMessage(err, '提交任务失败')
+      throw err
+    } finally {
+      if (submitAbortController === controller) {
+        submitAbortController = null
+        isSubmitting.value = false
+      }
+    }
+  }
+
   // --- Lifecycle ---
   onMounted(() => {
     fetchTasks()
@@ -525,6 +606,7 @@ export function useTaskViewModel() {
     isUpdatingTranscriptionSettings,
     summarizationSettings,
     isUpdatingSummarizationSettings,
+    isReadingBilibiliCookieFromBrowser,
 
     // Actions
     submitTask,
@@ -541,6 +623,10 @@ export function useTaskViewModel() {
     fetchSummarizationSettings,
     updateSummarizationSettings,
     testLlm,
+    readBilibiliCookieFromBrowser,
+    checkBilibiliVideoInfo,
+    submitTaskWithParts,
+    isBilibiliUrl,
     downloadContent,
     copyContent: async (type: 'summary' | 'transcript') => {
       if (!selectedTask.value) return false
