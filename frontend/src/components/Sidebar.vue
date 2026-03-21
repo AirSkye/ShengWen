@@ -22,6 +22,8 @@ import {
   PhPlayCircle,
   PhLightning,
   PhBrain,
+  PhFile,
+  PhQuestion,
 } from '@phosphor-icons/vue'
 import {
   TaskStatus,
@@ -102,6 +104,7 @@ const fileInput = ref<HTMLInputElement | null>(null)
 const isSettingsPanelOpen = ref(false)
 const settingsTab = ref<'llm' | 'transcription' | 'summarization'>('llm')
 const sidebarTab = ref<'quick' | 'manage' | 'theme'>('quick')
+const showLocalPathHelp = ref(false)
 
 const llmProvider = ref('')
 const llmBaseUrl = ref('')
@@ -196,9 +199,25 @@ const handleFileChange = (event: Event) => {
   }
 }
 
-const handleLocalPathInput = () => {
+const handleLocalPathInput = (event: Event) => {
   selectedFile.value = null
   videoUrl.value = ''
+
+  // 自动清理路径格式
+  const input = event.target as HTMLInputElement
+  let value = input.value
+
+  // 去除首尾空格和引号
+  value = value.trim()
+  if ((value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))) {
+    value = value.slice(1, -1)
+  }
+
+  // 更新清理后的值
+  if (value !== input.value) {
+    localFilePath.value = value
+  }
 }
 
 const handleClearSelectedFile = () => {
@@ -643,7 +662,7 @@ watch(() => props.summarizationSettings, (settings) => {
               <div class="min-w-0">
                 <h1 class="text-lg font-bold text-slate-900 tracking-tight truncate">声文智汇</h1>
                 <p class="text-[11px] text-slate-500">
-                  {{ sidebarTab === 'quick' ? '新建任务与快速浏览' : sidebarTab === 'manage' ? '全部任务搜索视图' : 'Markdown 样式主题' }} · v{{ appVersion }}
+                  {{ sidebarTab === 'quick' ? '快速提交与任务浏览' : sidebarTab === 'manage' ? '全部任务搜索视图' : 'Markdown 样式主题' }} · v{{ appVersion }}
                 </p>
               </div>
             </div>
@@ -1109,8 +1128,6 @@ watch(() => props.summarizationSettings, (settings) => {
         <template v-if="sidebarTab === 'quick'">
           <!-- 提交新任务 -->
           <div class="p-3 pb-2">
-            <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3">新建任务</h2>
-
             <div class="space-y-2.5">
               <div class="relative">
                 <PhLink :size="18" class="absolute left-3 top-3 text-slate-400" />
@@ -1142,18 +1159,33 @@ watch(() => props.summarizationSettings, (settings) => {
 
               <div
                 v-if="props.isLocalClient"
-                class="flex items-center gap-2 px-1"
+                class="flex items-center gap-1.5 px-1 mt-3 mb-1"
               >
-                <div class="h-px flex-1 bg-slate-200"></div>
-                <span class="text-[11px] font-medium text-slate-400"> 或 </span>
-                <div class="h-px flex-1 bg-slate-200"></div>
+                <span class="text-xs font-medium text-slate-600">根据本地文件路径创建</span>
+                <button
+                  @click="showLocalPathHelp = !showLocalPathHelp"
+                  class="p-0.5 text-slate-400 hover:text-primary hover:bg-blue-50 rounded transition-colors"
+                  title="如何复制本地文件路径"
+                >
+                  <PhQuestion :size="14" weight="bold" />
+                </button>
+              </div>
+
+              <!-- 帮助提示 -->
+              <div
+                v-if="props.isLocalClient && showLocalPathHelp"
+                class="mx-1 mb-2 p-2.5 bg-blue-50 border border-blue-100 rounded-lg text-xs text-slate-600 space-y-1"
+              >
+                <p class="font-medium text-slate-700">快速复制文件路径：</p>
+                <p>• Windows: 按住 <kbd class="px-1 py-0.5 bg-white border border-slate-300 rounded text-[10px] font-mono">Shift</kbd> + 右键文件 → "复制为路径"</p>
+                <p>• 或直接从文件管理器地址栏复制完整路径</p>
               </div>
 
               <div
                 v-if="props.isLocalClient"
                 class="relative"
               >
-                <PhUpload :size="18" class="absolute left-3 top-3 text-slate-400" />
+                <PhFile :size="18" class="absolute left-3 top-3 text-slate-400" />
                 <input
                   v-model="localFilePath"
                   type="text"

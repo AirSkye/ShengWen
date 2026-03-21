@@ -17,7 +17,7 @@ import {
 import { useToast } from './composables/useToast'
 import { stripDoubleBracePlaceholders } from './utils/formatters'
 import { postProcessCompiledMarkdown } from './utils/markdownPostProcessor'
-import type { Task, MarkdownHeadingItem, BilibiliVideoInfo, BilibiliPartsConfig } from './types'
+import type { Task, MarkdownHeadingItem, BilibiliVideoInfo, BilibiliPartsConfig, LocalFolderScanResult } from './types'
 import Sidebar from './components/Sidebar.vue'
 import FloatingToolbar from './components/FloatingToolbar.vue'
 import TaskInfoModal from './components/TaskInfoModal.vue'
@@ -26,6 +26,7 @@ import MermaidViewerModal from './components/MermaidViewerModal.vue'
 import SummaryImageWorkbenchModal from './components/SummaryImageWorkbenchModal.vue'
 import SettingsModal from './components/SettingsModal.vue'
 import BilibiliPartsSelector from './components/BilibiliPartsSelector.vue'
+import LocalFolderSelector from './components/LocalFolderSelector.vue'
 import ToastContainer from './components/ToastContainer.vue'
 
 const {
@@ -65,7 +66,10 @@ const {
   readBilibiliCookieFromBrowser,
   checkBilibiliVideoInfo,
   submitTaskWithParts,
-  isBilibiliUrl
+  isBilibiliUrl,
+  checkLocalPath,
+  scanLocalFolder,
+  submitLocalPathTasks,
 } = useTaskViewModel()
 
 // 状态变量
@@ -90,6 +94,11 @@ const isBilibiliPartsSelectorOpen = ref(false)
 const bilibiliVideoInfo = ref<BilibiliVideoInfo | null>(null)
 const isCheckingBilibiliVideoInfo = ref(false)
 const pendingBilibiliUrl = ref('')
+
+// 本地文件夹选择器状态
+const isLocalFolderSelectorOpen = ref(false)
+const localFolderInfo = ref<LocalFolderScanResult | null>(null)
+const isScanningLocalFolder = ref(false)
 
 // Mermaid 查看器
 const mermaidViewerModalRef = ref<{
@@ -451,6 +460,43 @@ const handleReadBilibiliCookieFromBrowser = async () => {
 const handleSubmit = async () => {
   // localhost 场景优先使用本地路径直读（避免文件上传复制）
   if (isLocalClient && localFilePath.value.trim()) {
+    // 先检查路径类型
+    const pathCheck = await checkLocalPath(localFilePath.value.trim())
+
+    // 处理检查失败的情况
+    if (!pathCheck) {
+      toastError('无法检查本地路径，请确认服务器是否正常运行')
+      return
+    }
+
+    if (pathCheck.type === 'not_found') {
+      toastError(`路径不存在: ${pathCheck.path}`)
+      return
+    }
+
+    if (pathCheck.type === 'folder') {
+      // 是文件夹，扫描并弹出选择器
+      isScanningLocalFolder.value = true
+      try {
+        const scanResult = await scanLocalFolder(localFilePath.value.trim())
+        if (scanResult && scanResult.files.length > 0) {
+          localFolderInfo.value = scanResult
+          isLocalFolderSelectorOpen.value = true
+        } else if (scanResult && scanResult.files.length === 0) {
+          toastError('文件夹中没有找到支持的视频/音频文件')
+        } else {
+          toastError('扫描文件夹失败，请重试')
+        }
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : '扫描文件夹失败'
+        toastError(errMsg)
+      } finally {
+        isScanningLocalFolder.value = false
+      }
+      return
+    }
+
+    // 是文件，直接提交
     await submitTask()
     return
   }
@@ -511,6 +557,26 @@ const handleBilibiliPartsClose = () => {
   isBilibiliPartsSelectorOpen.value = false
   bilibiliVideoInfo.value = null
   pendingBilibiliUrl.value = ''
+}
+
+const handleLocalFolderConfirm = async (config: { mode: 'merge' | 'separate'; paths: string[] }) => {
+  isLocalFolderSelectorOpen.value = false
+  try {
+    await submitLocalPathTasks(config.paths, config.mode)
+    localFilePath.value = ''
+    if (config.paths.length > 1) {
+      success(`已提交 ${config.paths.length} 个任务`)
+    } else {
+      success('已提交任务')
+    }
+  } catch (_e) {
+    // 错误信息由 useTaskViewModel + Toast 统一处理
+  }
+}
+
+const handleLocalFolderClose = () => {
+  isLocalFolderSelectorOpen.value = false
+  localFolderInfo.value = null
 }
 
 const startEditingTopic = () => {
@@ -831,6 +897,15 @@ watch(
       :isLoading="isCheckingBilibiliVideoInfo"
       @close="handleBilibiliPartsClose"
       @confirm="handleBilibiliPartsConfirm"
+    />
+
+    <!-- 本地文件夹选择器 -->
+    <LocalFolderSelector
+      :isOpen="isLocalFolderSelectorOpen"
+      :folderInfo="localFolderInfo"
+      :isLoading="isScanningLocalFolder"
+      @close="handleLocalFolderClose"
+      @confirm="handleLocalFolderConfirm"
     />
   </div>
 </template>

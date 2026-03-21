@@ -758,6 +758,81 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=f"文件上传失败: {str(e)}")
 
 
+@app.get("/local-path/check")
+async def check_local_path(file_path: str, request: Request):
+    """
+    检查本地路径类型（仅允许 localhost）。
+    返回: { "type": "file" | "folder" | "not_found", "path": "..." }
+    """
+    if not _is_loopback_client(request):
+        raise HTTPException(
+            status_code=403,
+            detail="仅允许本机 localhost 请求。"
+        )
+
+    raw_path = (file_path or "").strip().strip('"').strip("'")
+    if not raw_path:
+        return {"type": "not_found", "path": ""}
+
+    local_path = os.path.abspath(os.path.expandvars(os.path.expanduser(raw_path)))
+
+    if not os.path.exists(local_path):
+        return {"type": "not_found", "path": local_path}
+
+    if os.path.isfile(local_path):
+        return {"type": "file", "path": local_path}
+
+    if os.path.isdir(local_path):
+        return {"type": "folder", "path": local_path}
+
+    return {"type": "not_found", "path": local_path}
+
+
+@app.get("/local-folder/scan")
+async def scan_local_folder(folder_path: str, request: Request):
+    """
+    扫描本地文件夹，返回支持的视频/音频文件列表（仅允许 localhost）。
+    """
+    if not _is_loopback_client(request):
+        raise HTTPException(
+            status_code=403,
+            detail="仅允许本机 localhost 请求。"
+        )
+
+    raw_path = (folder_path or "").strip().strip('"').strip("'")
+    if not raw_path:
+        raise HTTPException(status_code=400, detail="folder_path 不能为空")
+
+    local_path = os.path.abspath(os.path.expandvars(os.path.expanduser(raw_path)))
+    if not os.path.exists(local_path) or not os.path.isdir(local_path):
+        raise HTTPException(status_code=400, detail=f"文件夹不存在: {local_path}")
+
+    files = []
+    try:
+        for entry in os.scandir(local_path):
+            if not entry.is_file():
+                continue
+            ext = os.path.splitext(entry.name)[1].lower()
+            if ext not in SUPPORTED_MEDIA_EXTENSIONS:
+                continue
+            try:
+                size = entry.stat().st_size
+            except OSError:
+                size = 0
+            files.append({
+                "name": entry.name,
+                "path": entry.path,
+                "size": size,
+            })
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"扫描文件夹失败: {e}")
+
+    # 按文件名排序
+    files.sort(key=lambda x: x["name"].lower())
+
+    return {"folder_path": local_path, "files": files, "total": len(files)}
+
+
 @app.post("/upload/local-path", response_model=Task, status_code=201)
 async def upload_local_path(payload: LocalPathTaskCreate, request: Request):
     """

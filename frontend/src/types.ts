@@ -163,3 +163,20 @@ export interface BilibiliPartsConfig {
   mode: 'merge' | 'separate';
   indices: number[];
 }
+
+export interface LocalFolderFile {
+  name: string;
+  path: string;
+  size: number;
+}
+
+export interface LocalFolderScanResult {
+  folder_path: string;
+  files: LocalFolderFile[];
+  total: number;
+}
+
+export interface LocalPathCheckResult {
+  type: 'file' | 'folder' | 'not_found';
+  path: string;
+}

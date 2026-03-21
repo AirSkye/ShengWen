@@ -13,7 +13,9 @@ import type {
   UpdateSummarizationSettingsRequest,
   BilibiliCookieFromBrowserResult,
   BilibiliVideoInfo,
-  BilibiliPartsConfig
+  BilibiliPartsConfig,
+  LocalPathCheckResult,
+  LocalFolderScanResult
 } from '../types'
 
 // 传统复制方法（兼容非安全上下文，如局域网 HTTP）
@@ -534,6 +536,72 @@ export function useTaskViewModel() {
     }
   }
 
+  const checkLocalPath = async (filePath: string): Promise<LocalPathCheckResult | null> => {
+    try {
+      const response = await axios.get(`${apiBaseUrl}/local-path/check`, {
+        params: { file_path: filePath }
+      })
+      return response.data as LocalPathCheckResult
+    } catch (err) {
+      console.error('Failed to check local path:', err)
+      return null
+    }
+  }
+
+  const scanLocalFolder = async (folderPath: string): Promise<LocalFolderScanResult | null> => {
+    try {
+      const response = await axios.get(`${apiBaseUrl}/local-folder/scan`, {
+        params: { folder_path: folderPath }
+      })
+      return response.data as LocalFolderScanResult
+    } catch (err) {
+      console.error('Failed to scan local folder:', err)
+      return null
+    }
+  }
+
+  const submitLocalPathTasks = async (
+    paths: string[],
+    mode: 'merge' | 'separate'
+  ): Promise<void> => {
+    const controller = new AbortController()
+    submitAbortController = controller
+    isSubmitting.value = true
+    error.value = null
+
+    try {
+      if (mode === 'merge') {
+        // 合并模式：暂时不支持，需要后端支持
+        error.value = '合并多个文件功能开发中，请选择"拆分为多个任务"'
+        throw new Error('Merge mode not supported yet')
+      } else {
+        // 分别模式：逐个提交
+        for (const path of paths) {
+          await axios.post(`${apiBaseUrl}/upload/local-path`, {
+            file_path: path,
+            summary_mode: summaryMode.value,
+          }, {
+            signal: controller.signal
+          })
+        }
+      }
+    } catch (err) {
+      if (isCanceledRequest(err)) {
+        return
+      }
+      console.error('Failed to submit local path tasks:', err)
+      if (!error.value) {
+        error.value = getAxiosErrorMessage(err, '提交任务失败')
+      }
+      throw err
+    } finally {
+      if (submitAbortController === controller) {
+        submitAbortController = null
+        isSubmitting.value = false
+      }
+    }
+  }
+
   const submitTaskWithParts = async (
     videoUrl: string,
     partsConfig: BilibiliPartsConfig,
@@ -626,6 +694,9 @@ export function useTaskViewModel() {
     readBilibiliCookieFromBrowser,
     checkBilibiliVideoInfo,
     submitTaskWithParts,
+    checkLocalPath,
+    scanLocalFolder,
+    submitLocalPathTasks,
     isBilibiliUrl,
     downloadContent,
     copyContent: async (type: 'summary' | 'transcript') => {
