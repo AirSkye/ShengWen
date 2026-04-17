@@ -266,6 +266,7 @@ class TranscriptionSettingsManager:
         model_source: str = "auto_download",
         model_path: str | None = None,
         initial_enable_bilibili_subtitle_fetch: bool = True,
+        initial_enable_asr_transcription: bool = False,
         initial_bilibili_sessdata: str = "",
     ):
         self._lock = Lock()
@@ -277,6 +278,7 @@ class TranscriptionSettingsManager:
             # 兼容旧配置：曾填写过 model_path 时默认沿用手动模式。
             self._model_source = "manual_path"
         self._enable_bilibili_subtitle_fetch = initial_enable_bilibili_subtitle_fetch
+        self._enable_asr_transcription = bool(initial_enable_asr_transcription)
         self._bilibili_sessdata = _sanitize_cookie_value(initial_bilibili_sessdata)
         self._transcriber_worker: Any = None
 
@@ -304,6 +306,7 @@ class TranscriptionSettingsManager:
         with self._lock:
             current_device = self._device
             enable_bilibili_subtitle_fetch = self._enable_bilibili_subtitle_fetch
+            enable_asr_transcription = self._enable_asr_transcription
             model_source = self._model_source
             model_size = self._model_size
             model_path = self._model_path
@@ -341,6 +344,7 @@ class TranscriptionSettingsManager:
             "cuda_reason": str(cuda_diag["cuda_reason"]),
             "cuda_message": str(cuda_diag["cuda_message"]),
             "enable_bilibili_subtitle_fetch": enable_bilibili_subtitle_fetch,
+            "enable_asr_transcription": enable_asr_transcription,
             "has_bilibili_sessdata": bool(sessdata),
             "bilibili_cookie_source": source,
             "bilibili_sessdata_masked": _mask_cookie_value(sessdata),
@@ -379,6 +383,7 @@ class TranscriptionSettingsManager:
         model_size: Literal["tiny", "base", "small", "medium", "large"] | str | None = None,
         model_path: str | None = None,
         enable_bilibili_subtitle_fetch: bool | None = None,
+        enable_asr_transcription: bool | None = None,
         bilibili_sessdata: str | None = None,
         clear_bilibili_sessdata: bool | None = None,
     ) -> dict[str, Any]:
@@ -388,6 +393,7 @@ class TranscriptionSettingsManager:
             and model_size is None
             and model_path is None
             and enable_bilibili_subtitle_fetch is None
+            and enable_asr_transcription is None
             and bilibili_sessdata is None
             and clear_bilibili_sessdata is None
         ):
@@ -489,6 +495,12 @@ class TranscriptionSettingsManager:
                     "[TranscriptionSettingsManager] 已更新字幕直取开关: "
                     f"enable_bilibili_subtitle_fetch={self._enable_bilibili_subtitle_fetch}"
                 )
+            if enable_asr_transcription is not None:
+                self._enable_asr_transcription = bool(enable_asr_transcription)
+                logger.info(
+                    "[TranscriptionSettingsManager] 已更新 ASR 开关: "
+                    f"enable_asr_transcription={self._enable_asr_transcription}"
+                )
 
             if clear_bilibili_sessdata:
                 self._bilibili_sessdata = ""
@@ -538,6 +550,6 @@ class TranscriptionSettingsManager:
                 "model_size": self._model_size,
                 "model_path": self._model_path,
                 "enable_bilibili_subtitle_fetch": self._enable_bilibili_subtitle_fetch,
+                "enable_asr_transcription": self._enable_asr_transcription,
                 "bilibili_sessdata": self._bilibili_sessdata,
             }
-

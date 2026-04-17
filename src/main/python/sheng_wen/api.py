@@ -3,6 +3,7 @@ import asyncio
 import json
 import glob
 import ipaddress
+import re
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi import Form
 from fastapi.responses import JSONResponse
@@ -98,6 +99,7 @@ if os.path.exists(dist_dir):
 class TaskCreate(BaseModel):
     video_url: HttpUrl
     quality: Optional[str] = "best" # "best", "audio_only"
+    title: Optional[str] = Field(default=None, description="任务标题（用户输入）")
     summary_mode: Optional[str] = Field(
         default=None,
         description="总结模式: standard | agent | auto（前端建议仅 standard/agent）",
@@ -109,6 +111,7 @@ class TaskCreate(BaseModel):
 
 class LocalPathTaskCreate(BaseModel):
     file_path: str = Field(..., min_length=1, description="本机文件绝对路径")
+    title: Optional[str] = Field(default=None, description="任务标题（用户输入）")
     summary_mode: Optional[str] = Field(
         default=None,
         description="总结模式: standard | agent | auto（前端建议仅 standard/agent）",
@@ -199,6 +202,7 @@ class TranscriptionSettings(BaseModel):
     cuda_reason: str
     cuda_message: str
     enable_bilibili_subtitle_fetch: bool
+    enable_asr_transcription: bool
     has_bilibili_sessdata: bool
     bilibili_cookie_source: str
     bilibili_sessdata_masked: str
@@ -212,6 +216,10 @@ class TranscriptionSettingsUpdate(BaseModel):
     enable_bilibili_subtitle_fetch: Optional[bool] = Field(
         default=None,
         description="是否优先尝试直取 B 站字幕（失败时回退 ASR）"
+    )
+    enable_asr_transcription: Optional[bool] = Field(
+        default=None,
+        description="是否允许回退到模型语音识别（ASR）。关闭后仅允许字幕来源。",
     )
     bilibili_sessdata: Optional[str] = Field(
         default=None,
@@ -258,6 +266,7 @@ class BilibiliPartsConfig(BaseModel):
 class TaskCreate(BaseModel):
     video_url: HttpUrl
     quality: Optional[str] = "best" # "best", "audio_only"
+    title: Optional[str] = Field(default=None, description="任务标题（用户输入）")
     summary_mode: Optional[str] = Field(
         default=None,
         description="总结模式: standard | agent | auto（前端建议仅 standard/agent）",
@@ -408,6 +417,7 @@ initial_transcription_device = str(whisper_cfg.device).lower()
 if initial_transcription_device not in {"cpu", "cuda"}:
     initial_transcription_device = "cpu"
 initial_enable_bilibili_subtitle_fetch = bool(whisper_cfg.enable_bilibili_subtitle_fetch)
+initial_enable_asr_transcription = bool(getattr(whisper_cfg, "enable_asr_transcription", False))
 initial_bilibili_sessdata = str(whisper_cfg.bilibili_sessdata or "")
 
 transcription_settings_manager = TranscriptionSettingsManager(
@@ -416,6 +426,7 @@ transcription_settings_manager = TranscriptionSettingsManager(
     model_size=whisper_cfg.model_size,
     model_path=whisper_cfg.configured_model_path,
     initial_enable_bilibili_subtitle_fetch=initial_enable_bilibili_subtitle_fetch,
+    initial_enable_asr_transcription=initial_enable_asr_transcription,
     initial_bilibili_sessdata=initial_bilibili_sessdata,
 )
 llm_provider_manager = LLMProviderManager(
@@ -449,6 +460,8 @@ async def get_transcriber_worker():
     global transcriber_worker
     if transcriber_worker is not None:
         return transcriber_worker
+    if not _is_asr_transcription_enabled():
+        raise ModelLoadError("当前未开启模型语音识别（ASR），请在转录设置中手动开启后再使用音频转录。")
 
     from .transcriber.transcriber import get_transcriber
     from .transcriber.transcriber_worker import TranscriberWorker
@@ -482,12 +495,12 @@ async def get_downloader_worker():
 
     from .downloader.video_downloader_worker import VideoDownloaderWorker
 
-    transcriber_w = await get_transcriber_worker()
     llm_w = await get_llm_worker()
 
     downloader_worker = VideoDownloaderWorker(
         name="VideoDownloaderWorker",
-        next_worker=transcriber_w,
+        next_worker=None,
+        transcriber_worker_factory=get_transcriber_worker,
         summary_worker=llm_w,
         transcription_settings_manager=transcription_settings_manager,
     )
@@ -587,6 +600,67 @@ def _normalize_summary_mode(raw_value: str | None, fallback: str | None = None) 
     return _resolve_default_summary_mode()
 
 
+def _is_asr_transcription_enabled() -> bool:
+    try:
+        settings = transcription_settings_manager.get_settings()
+        return bool(settings.get("enable_asr_transcription", False))
+    except Exception:
+        return False
+
+
+def _normalize_task_title(title: str | None, fallback: str) -> str:
+    normalized = str(title or "").strip()
+    return normalized or fallback
+
+
+def _normalize_subtitle_text(raw_text: str, source_name: str) -> str:
+    text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    logger.info(f"[SubtitleUpload] 开始标准化字幕文本: source={source_name}, raw_chars={len(text)}")
+    lines = text.split("\n")
+
+    normalized_lines: list[str] = []
+    synthetic_index = 0
+    for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        if re.match(r"^\d+$", line):
+            continue
+        if "-->" in line:
+            continue
+
+        pure_text = line
+        match = re.match(r"^(?:\[(\d{1,2}:\d{2}(?::\d{2})?)\]|(\d{1,2}:\d{2}(?::\d{2})?))[ \t\-:：]*(.*)$", line)
+        if match:
+            ts = match.group(1) or match.group(2) or ""
+            pure_text = (match.group(3) or "").strip()
+            if pure_text:
+                parts = [int(p) for p in ts.split(":")]
+                if len(parts) == 2:
+                    seconds = parts[0] * 60 + parts[1]
+                else:
+                    seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
+                hh = int(seconds // 3600)
+                mm = int((seconds % 3600) // 60)
+                ss = int(seconds % 60)
+                normalized_lines.append(f"{hh:02d}{mm:02d}{ss:02d}{pure_text}")
+                continue
+
+        if pure_text:
+            seconds = synthetic_index * 3
+            synthetic_index += 1
+            hh = int(seconds // 3600)
+            mm = int((seconds % 3600) // 60)
+            ss = int(seconds % 60)
+            normalized_lines.append(f"{hh:02d}{mm:02d}{ss:02d}{pure_text}")
+
+    result = "\n".join(normalized_lines).strip()
+    logger.info(
+        f"[SubtitleUpload] 字幕标准化完成: source={source_name}, lines={len(normalized_lines)}, result_chars={len(result)}"
+    )
+    return result
+
+
 async def _try_resolve_and_persist_author(task_id: str, video_url: str) -> bool:
     try:
         from .task_updater import update_and_notify
@@ -674,10 +748,14 @@ def _resolve_local_media_file(task_id: str, task: dict) -> str | None:
 async def upload_file(
     file: UploadFile = File(...),
     summary_mode: Optional[str] = Form(default=None),
+    title: Optional[str] = Form(default=None),
 ):
     """
     接收上传的视频/音频文件
     """
+    if not _is_asr_transcription_enabled():
+        raise HTTPException(status_code=400, detail="当前未开启模型语音识别（ASR），仅支持字幕来源任务。")
+
     # 验证文件类型
     file_ext = os.path.splitext(file.filename)[1].lower() if file.filename else ''
 
@@ -725,7 +803,7 @@ async def upload_file(
             "created_at": datetime.utcnow(),
             "latest_modified_at": datetime.utcnow(),
             "progress": 0.0,
-            "title": os.path.splitext(file.filename)[0] if file.filename else "Uploaded File",
+            "title": _normalize_task_title(title, os.path.splitext(file.filename)[0] if file.filename else "Uploaded File"),
             "author_name": None,
             "author_url": None,
             "summary_mode": resolved_summary_mode,
@@ -843,6 +921,8 @@ async def upload_local_path(payload: LocalPathTaskCreate, request: Request):
             status_code=403,
             detail="仅允许本机 localhost 请求使用本地路径直读。"
         )
+    if not _is_asr_transcription_enabled():
+        raise HTTPException(status_code=400, detail="当前未开启模型语音识别（ASR），仅支持字幕来源任务。")
 
     raw_path = (payload.file_path or "").strip().strip('"')
     if not raw_path:
@@ -860,7 +940,7 @@ async def upload_local_path(payload: LocalPathTaskCreate, request: Request):
         )
 
     task_id = str(uuid.uuid4())
-    title = os.path.splitext(os.path.basename(local_path))[0] or "Local File"
+    title = _normalize_task_title(payload.title, os.path.splitext(os.path.basename(local_path))[0] or "Local File")
     resolved_summary_mode = _normalize_summary_mode(payload.summary_mode)
     os.makedirs("temp", exist_ok=True)
     task_data = {
@@ -889,6 +969,84 @@ async def upload_local_path(payload: LocalPathTaskCreate, request: Request):
 
     worker = await _resolve_worker_or_raise(get_transcriber_worker, task_id=task_id)
     await worker.add_task(payload_data)
+    await notify_task_update(task_id)
+    return task_data
+
+
+@app.post("/tasks/subtitle", response_model=Task, status_code=201)
+async def create_subtitle_task(
+    subtitle_file: UploadFile | None = File(default=None),
+    subtitle_text: Optional[str] = Form(default=None),
+    title: Optional[str] = Form(default=None),
+    summary_mode: Optional[str] = Form(default=None),
+):
+    provided_text = str(subtitle_text or "").strip()
+    if subtitle_file is None and not provided_text:
+        raise HTTPException(status_code=400, detail="请上传字幕文件，或粘贴字幕文本。")
+
+    file_content = ""
+    source_name = "pasted_text"
+    if subtitle_file is not None:
+        source_name = subtitle_file.filename or "uploaded_subtitle"
+        try:
+            raw_bytes = await subtitle_file.read()
+            file_content = raw_bytes.decode("utf-8", errors="replace")
+            logger.info(
+                f"[SubtitleUpload] 收到字幕文件: name={source_name}, size={len(raw_bytes)} bytes"
+            )
+        except Exception as e:
+            logger.error(f"[SubtitleUpload] 读取字幕文件失败: {e}", exc_info=True)
+            raise HTTPException(status_code=400, detail="字幕文件读取失败，请检查文件编码后重试。")
+
+    raw_subtitle = provided_text or file_content
+    normalized_transcript = _normalize_subtitle_text(raw_subtitle, source_name)
+    if not normalized_transcript:
+        raise HTTPException(status_code=400, detail="未识别到可用字幕文本，请检查内容。")
+
+    task_id = str(uuid.uuid4())
+    resolved_summary_mode = _normalize_summary_mode(summary_mode)
+    task_title = _normalize_task_title(title, "字幕总结任务")
+
+    os.makedirs("temp", exist_ok=True)
+    intermediate_file_path = os.path.join("temp", f"{task_id}_subtitle_input.txt")
+    output_file = os.path.join("temp", f"{task_id}_summary.md")
+    with open(intermediate_file_path, "w", encoding="utf-8", errors="replace") as f:
+        f.write(normalized_transcript)
+
+    task_data = {
+        "id": task_id,
+        "video_url": "subtitle://uploaded",
+        "status": TaskStatus.SUMMARIZING,
+        "created_at": datetime.utcnow(),
+        "latest_modified_at": datetime.utcnow(),
+        "progress": 0.0,
+        "title": task_title,
+        "transcript": normalized_transcript,
+        "transcription_time": 0.0,
+        "audio_duration": None,
+        "author_name": None,
+        "author_url": None,
+        "summary_mode": resolved_summary_mode,
+        "summary_chunk_total": None,
+        "summary_chunk_done": None,
+        "summary_meta": None,
+    }
+    db.save_task(task_id, task_data)
+
+    logger.info(
+        f"[SubtitleUpload] 创建字幕总结任务: task_id={task_id}, source={source_name}, "
+        f"mode={resolved_summary_mode}, title={task_title}, transcript_chars={len(normalized_transcript)}"
+    )
+
+    worker = await _resolve_worker_or_raise(get_llm_worker, task_id=task_id)
+    await worker.add_task(
+        {
+            "task_id": task_id,
+            "intermediate_file_path": intermediate_file_path,
+            "output_file": output_file,
+            "summary_mode": resolved_summary_mode,
+        }
+    )
     await notify_task_update(task_id)
     return task_data
 
@@ -938,6 +1096,10 @@ async def create_task(task_in: TaskCreate):
     """
     提交一个新的视频处理任务
     """
+    input_video_url = str(task_in.video_url)
+    if not _is_bilibili_video_url(input_video_url):
+        raise HTTPException(status_code=400, detail="当前版本仅支持 B 站链接字幕总结，非 B 站链接请改用上传字幕。")
+
     # 处理 B 站分P拆分模式
     if task_in.bilibili_parts and task_in.bilibili_parts.mode == "separate":
         # 获取视频标题和分P信息
@@ -962,9 +1124,9 @@ async def create_task(task_in: TaskCreate):
                     break
 
             # 构建任务标题
-            task_title = f"{video_title} - P{part_index + 1}"
+            task_title = _normalize_task_title(task_in.title, f"{video_title} - P{part_index + 1}")
             if part_title:
-                task_title = f"{video_title} - P{part_index + 1}: {part_title}"
+                task_title = _normalize_task_title(task_in.title, f"{video_title} - P{part_index + 1}: {part_title}")
 
             task_data = {
                 "id": task_id,
@@ -989,6 +1151,7 @@ async def create_task(task_in: TaskCreate):
                 "video_url": str(task_in.video_url),
                 "quality": task_in.quality,
                 "summary_mode": resolved_summary_mode,
+                "subtitle_only": True,
                 # 传递单个分P索引，让 worker 处理该分P
                 "bilibili_parts": {
                     "mode": "merge",  # 单个分P用 merge 模式即可
@@ -1013,11 +1176,12 @@ async def create_task(task_in: TaskCreate):
     resolved_summary_mode = _normalize_summary_mode(task_in.summary_mode)
     task_data = {
         "id": task_id,
-        "video_url": str(task_in.video_url),
+        "video_url": input_video_url,
         "status": TaskStatus.PENDING,
         "created_at": datetime.utcnow(),
         "latest_modified_at": datetime.utcnow(),
         "progress": 0.0,
+        "title": _normalize_task_title(task_in.title, "B站字幕总结任务"),
         "author_name": None,
         "author_url": None,
         "summary_mode": resolved_summary_mode,
@@ -1030,9 +1194,10 @@ async def create_task(task_in: TaskCreate):
     worker = await _resolve_worker_or_raise(get_downloader_worker, task_id=task_id)
     task_payload = {
         "task_id": task_id,
-        "video_url": str(task_in.video_url),
+        "video_url": input_video_url,
         "quality": task_in.quality,
         "summary_mode": resolved_summary_mode,
+        "subtitle_only": True,
     }
     task_cookie = _sanitize_cookie_value(task_in.bilibili_sessdata)
     if task_cookie:
@@ -1450,6 +1615,7 @@ async def update_transcription_settings(payload: TranscriptionSettingsUpdate):
             model_size=payload.model_size,
             model_path=payload.model_path,
             enable_bilibili_subtitle_fetch=payload.enable_bilibili_subtitle_fetch,
+            enable_asr_transcription=payload.enable_asr_transcription,
             bilibili_sessdata=payload.bilibili_sessdata,
             clear_bilibili_sessdata=payload.clear_bilibili_sessdata,
         )
@@ -1600,4 +1766,8 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    if not _is_asr_transcription_enabled():
+        raise HTTPException(status_code=400, detail="当前未开启模型语音识别（ASR），仅支持字幕来源任务。")
 
+    if not _is_asr_transcription_enabled():
+        raise HTTPException(status_code=400, detail="当前未开启模型语音识别（ASR），仅支持字幕来源任务。")

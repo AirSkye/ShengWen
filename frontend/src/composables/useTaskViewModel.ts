@@ -136,7 +136,11 @@ export function useTaskViewModel() {
   const tasks = ref<Task[]>([])
   const selectedTask = ref<Task | null>(null)
   const videoUrl = ref('')
+  const taskTitle = ref('')
   const selectedFile = ref<File | null>(null)
+  const selectedSubtitleFile = ref<File | null>(null)
+  const subtitleText = ref('')
+  const inputSourceMode = ref<'bilibili' | 'subtitle'>('bilibili')
   const localFilePath = ref('')
   const quality = ref('audio_only')
   const summaryMode = ref<Exclude<SummaryMode, 'auto'>>('standard')
@@ -177,6 +181,11 @@ export function useTaskViewModel() {
   }
 
   const submitTask = async () => {
+    if (inputSourceMode.value === 'subtitle') {
+      await submitSubtitleTask()
+      return
+    }
+
     // localhost 场景优先使用本地路径直读（避免文件上传复制）
     if (isLocalClient && localFilePath.value.trim()) {
       await submitLocalPathTask(localFilePath.value)
@@ -205,11 +214,13 @@ export function useTaskViewModel() {
         video_url: resolvedUrl,
         quality: quality.value,
         summary_mode: summaryMode.value,
+        title: taskTitle.value.trim() || undefined,
       }
       await axios.post(`${apiBaseUrl}/tasks/`, payload, {
         signal: controller.signal
       })
       videoUrl.value = ''
+      taskTitle.value = ''
       // No need to fetchTasks here, WS will notify
     } catch (err) {
       if (isCanceledRequest(err)) {
@@ -240,11 +251,13 @@ export function useTaskViewModel() {
       await axios.post(`${apiBaseUrl}/upload/local-path`, {
         file_path: normalized,
         summary_mode: summaryMode.value,
+        title: taskTitle.value.trim() || undefined,
       }, {
         signal: controller.signal
       })
       localFilePath.value = ''
       selectedFile.value = null
+      taskTitle.value = ''
     } catch (err) {
       if (isCanceledRequest(err)) {
         return
@@ -268,6 +281,9 @@ export function useTaskViewModel() {
       const formData = new FormData()
       formData.append('file', file)
       formData.append('summary_mode', summaryMode.value)
+      if (taskTitle.value.trim()) {
+        formData.append('title', taskTitle.value.trim())
+      }
 
       await axios.post(`${apiBaseUrl}/upload`, formData, {
         headers: {
@@ -278,6 +294,7 @@ export function useTaskViewModel() {
 
       selectedFile.value = null
       localFilePath.value = ''
+      taskTitle.value = ''
       // No need to fetchTasks here, WS will notify
     } catch (err) {
       if (isCanceledRequest(err)) {
@@ -285,6 +302,52 @@ export function useTaskViewModel() {
       }
       console.error('Failed to upload file:', err)
       error.value = getAxiosErrorMessage(err, '上传失败')
+    } finally {
+      if (submitAbortController === controller) {
+        submitAbortController = null
+        isSubmitting.value = false
+      }
+    }
+  }
+
+  const submitSubtitleTask = async () => {
+    const hasFile = !!selectedSubtitleFile.value
+    const hasText = !!subtitleText.value.trim()
+    if (!hasFile && !hasText) {
+      error.value = '请上传字幕文件，或直接粘贴字幕文本。'
+      return
+    }
+    const controller = new AbortController()
+    submitAbortController = controller
+    isSubmitting.value = true
+    error.value = null
+    try {
+      const formData = new FormData()
+      if (hasFile && selectedSubtitleFile.value) {
+        formData.append('subtitle_file', selectedSubtitleFile.value)
+      }
+      if (hasText) {
+        formData.append('subtitle_text', subtitleText.value)
+      }
+      formData.append('summary_mode', summaryMode.value)
+      formData.append('title', taskTitle.value.trim() || '字幕总结任务')
+
+      await axios.post(`${apiBaseUrl}/tasks/subtitle`, formData, {
+        headers: {
+          'Content-Type': 'multipart/form-data'
+        },
+        signal: controller.signal
+      })
+      selectedSubtitleFile.value = null
+      subtitleText.value = ''
+      taskTitle.value = ''
+      videoUrl.value = ''
+      selectedFile.value = null
+      localFilePath.value = ''
+    } catch (err) {
+      if (isCanceledRequest(err)) return
+      console.error('Failed to submit subtitle task:', err)
+      error.value = getAxiosErrorMessage(err, '提交字幕总结失败')
     } finally {
       if (submitAbortController === controller) {
         submitAbortController = null
@@ -658,7 +721,11 @@ export function useTaskViewModel() {
     tasks,
     selectedTask,
     videoUrl,
+    taskTitle,
     selectedFile,
+    selectedSubtitleFile,
+    subtitleText,
+    inputSourceMode,
     localFilePath,
     isLocalClient,
     quality,
