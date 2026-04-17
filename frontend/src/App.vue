@@ -33,7 +33,11 @@ const {
   tasks,
   selectedTask,
   videoUrl,
+  taskTitle,
   selectedFile,
+  selectedSubtitleFile,
+  subtitleText,
+  inputSourceMode,
   localFilePath,
   isLocalClient,
   quality,
@@ -458,6 +462,12 @@ const handleReadBilibiliCookieFromBrowser = async () => {
 
 // B站分P处理
 const handleSubmit = async () => {
+  // 字幕上传/粘贴模式：直接按字幕任务提交流程走，不做链接校验
+  if (inputSourceMode.value === 'subtitle') {
+    await submitTask()
+    return
+  }
+
   // localhost 场景优先使用本地路径直读（避免文件上传复制）
   if (isLocalClient && localFilePath.value.trim()) {
     // 先检查路径类型
@@ -758,7 +768,11 @@ watch(
     <!-- 左侧边栏 -->
     <Sidebar
       v-model:videoUrl="videoUrl"
+      v-model:taskTitle="taskTitle"
       v-model:selectedFile="selectedFile"
+      v-model:selectedSubtitleFile="selectedSubtitleFile"
+      v-model:subtitleText="subtitleText"
+      v-model:inputSourceMode="inputSourceMode"
       v-model:localFilePath="localFilePath"
       v-model:quality="quality"
       v-model:summaryMode="summaryMode"
@@ -918,4 +932,3 @@ watch(
 /* 移动端点击高亮优化 */
 html, body { -webkit-tap-highlight-color: transparent; }
 </style>
-
