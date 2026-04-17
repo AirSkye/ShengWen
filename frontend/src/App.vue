@@ -462,6 +462,12 @@ const handleReadBilibiliCookieFromBrowser = async () => {
 
 // B站分P处理
 const handleSubmit = async () => {
+  // 字幕上传/粘贴模式：直接按字幕任务提交流程走，不做链接校验
+  if (inputSourceMode.value === 'subtitle') {
+    await submitTask()
+    return
+  }
+
   // localhost 场景优先使用本地路径直读（避免文件上传复制）
   if (isLocalClient && localFilePath.value.trim()) {
     // 先检查路径类型
