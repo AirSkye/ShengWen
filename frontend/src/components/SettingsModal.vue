@@ -48,6 +48,7 @@ const emit = defineEmits<{
     model_size?: 'tiny' | 'base' | 'small' | 'medium' | 'large'
     model_path?: string
     enable_bilibili_subtitle_fetch?: boolean
+    enable_asr_transcription?: boolean
     bilibili_sessdata?: string
     clear_bilibili_sessdata?: boolean
   }]
@@ -79,6 +80,7 @@ const transcriptionModelSource = ref<'auto_download' | 'manual_path'>('auto_down
 const transcriptionModelSize = ref<'tiny' | 'base' | 'small' | 'medium' | 'large'>('tiny')
 const transcriptionModelPathInput = ref('')
 const enableBilibiliSubtitleFetch = ref(true)
+const enableAsrTranscription = ref(false)
 const globalBilibiliSessdataInput = ref('')
 
 // Agent 设置
@@ -129,6 +131,7 @@ watch(() => props.transcriptionSettings, (settings) => {
     transcriptionModelSize.value = settings.model_size || 'tiny'
     transcriptionModelPathInput.value = settings.model_path || ''
     enableBilibiliSubtitleFetch.value = settings.enable_bilibili_subtitle_fetch ?? true
+    enableAsrTranscription.value = settings.enable_asr_transcription ?? false
   }
 }, { immediate: true })
 
@@ -208,13 +211,15 @@ const handleSaveTranscriptionSettings = () => {
     model_size?: 'tiny' | 'base' | 'small' | 'medium' | 'large'
     model_path?: string
     enable_bilibili_subtitle_fetch?: boolean
+    enable_asr_transcription?: boolean
     bilibili_sessdata?: string
   } = {
     device: transcriptionDevice.value,
     model_source: transcriptionModelSource.value,
     model_size: transcriptionModelSize.value,
     model_path: transcriptionModelPathInput.value.trim(),
-    enable_bilibili_subtitle_fetch: enableBilibiliSubtitleFetch.value
+    enable_bilibili_subtitle_fetch: enableBilibiliSubtitleFetch.value,
+    enable_asr_transcription: enableAsrTranscription.value,
   }
 
   const cookie = globalBilibiliSessdataInput.value.trim()
@@ -581,7 +586,7 @@ const handleSaveSummarizationSettings = () => {
               <div class="flex-1 min-w-0">
                 <p class="text-sm font-medium text-slate-700">优先使用 B 站字幕</p>
                 <p class="text-xs text-slate-500 mt-0.5">
-                  仅对 B 站链接生效；未获取到字幕时自动回退到下载+ASR
+                  仅对 B 站链接生效；默认不回退 ASR
                 </p>
               </div>
               <button
@@ -597,6 +602,31 @@ const handleSaveSummarizationSettings = () => {
                   :class="[
                     'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
                     enableBilibiliSubtitleFetch ? 'translate-x-5' : 'translate-x-0'
+                  ]"
+                ></span>
+              </button>
+            </div>
+
+            <div class="flex items-center justify-between gap-3 px-4 py-3 rounded-xl border border-slate-200 bg-slate-50">
+              <div class="flex-1 min-w-0">
+                <p class="text-sm font-medium text-slate-700">允许模型语音识别（ASR）</p>
+                <p class="text-xs text-slate-500 mt-0.5">
+                  关闭时不会加载/使用语音识别模型；只能依赖字幕来源。
+                </p>
+              </div>
+              <button
+                @click="enableAsrTranscription = !enableAsrTranscription"
+                :class="[
+                  'relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2',
+                  enableAsrTranscription ? 'bg-blue-500' : 'bg-slate-300'
+                ]"
+                role="switch"
+                :aria-checked="enableAsrTranscription"
+              >
+                <span
+                  :class="[
+                    'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
+                    enableAsrTranscription ? 'translate-x-5' : 'translate-x-0'
                   ]"
                 ></span>
               </button>

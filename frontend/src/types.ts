@@ -94,6 +94,7 @@ export interface TranscriptionSettings {
   cuda_reason: string;
   cuda_message: string;
   enable_bilibili_subtitle_fetch: boolean;
+  enable_asr_transcription: boolean;
   has_bilibili_sessdata: boolean;
   bilibili_cookie_source: string;
   bilibili_sessdata_masked: string;
@@ -105,6 +106,7 @@ export interface UpdateTranscriptionSettingsRequest {
   model_size?: "tiny" | "base" | "small" | "medium" | "large";
   model_path?: string;
   enable_bilibili_subtitle_fetch?: boolean;
+  enable_asr_transcription?: boolean;
   bilibili_sessdata?: string;
   clear_bilibili_sessdata?: boolean;
 }

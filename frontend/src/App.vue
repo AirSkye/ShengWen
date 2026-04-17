@@ -436,6 +436,7 @@ const handleUpdateTranscriptionSettings = async (payload: {
   model_size?: 'tiny' | 'base' | 'small' | 'medium' | 'large'
   model_path?: string
   enable_bilibili_subtitle_fetch?: boolean
+  enable_asr_transcription?: boolean
   bilibili_sessdata?: string
   clear_bilibili_sessdata?: boolean
 }) => {

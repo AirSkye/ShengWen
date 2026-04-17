@@ -21,15 +21,44 @@ class VideoDownloaderWorker(Worker):
         self,
         name: str,
         next_worker: Worker = None,
+        transcriber_worker_factory: Any = None,
         summary_worker: Worker = None,
         transcription_settings_manager: Any = None
     ):
         super().__init__(name)
         self.next_worker = next_worker
+        self.transcriber_worker_factory = transcriber_worker_factory
         self.summary_worker = summary_worker
         self.transcription_settings_manager = transcription_settings_manager
         self.output_dir = "temp"
         os.makedirs(self.output_dir, exist_ok=True)
+
+    def _asr_enabled(self) -> bool:
+        manager = self.transcription_settings_manager
+        if manager is None:
+            return False
+        try:
+            settings = manager.get_settings()
+            return bool(settings.get("enable_asr_transcription", False))
+        except Exception as e:
+            logger.warning(f"[{self.name}] 读取 ASR 开关失败，默认关闭: {e}")
+            return False
+
+    def _resolve_transcriber_worker_if_needed(self) -> Worker | None:
+        if self.next_worker is not None:
+            return self.next_worker
+        if not self._asr_enabled():
+            return None
+        if not self.transcriber_worker_factory or not self._loop:
+            return None
+        try:
+            future = asyncio.run_coroutine_threadsafe(self.transcriber_worker_factory(), self._loop)
+            self.next_worker = future.result(timeout=30)
+            logger.info(f"[{self.name}] 已按需初始化转录 worker（ASR 已开启）。")
+            return self.next_worker
+        except Exception as e:
+            logger.error(f"[{self.name}] 按需初始化转录 worker 失败: {e}", exc_info=True)
+            return None
 
     @staticmethod
     def _is_bilibili_url(video_url: str) -> bool:
@@ -640,6 +669,19 @@ class VideoDownloaderWorker(Worker):
 
             if self._try_process_with_bilibili_subtitle(payload):
                 return
+            if not self._asr_enabled():
+                if task_id:
+                    from ..db import TaskStatus
+                    from ..task_updater import update_and_notify
+                    self._submit_coro(update_and_notify(
+                        task_id,
+                        {
+                            "status": TaskStatus.FAILED,
+                            "error_message": "当前未开启模型语音识别（ASR），且未获取到可用字幕，任务已终止。",
+                        },
+                    ))
+                logger.warning(f"[{self.name}] task={task_id} 未取到字幕且 ASR 关闭，终止任务。")
+                return
         except TaskCancelledError as e:
             logger.info(f"[{self.name}] {e}")
             return
@@ -720,14 +762,25 @@ class VideoDownloaderWorker(Worker):
                 from ..task_updater import update_and_notify
                 self._submit_coro(update_and_notify(task_id, {"status": TaskStatus.TRANSCRIBING}))
 
-            if self.next_worker:
+            next_worker = self._resolve_transcriber_worker_if_needed()
+            if next_worker:
                 next_payload = payload.copy()
                 next_payload['video_file'] = video_path
                 base_name = os.path.splitext(os.path.basename(video_path))[0]
                 next_payload['audio_file'] = os.path.join(self.output_dir, f"{base_name}.mp3")
                 next_payload['output_file'] = os.path.join(self.output_dir, f"{base_name}_summary.md")
                 
-                self._submit_coro(self.next_worker.add_task(next_payload))
+                self._submit_coro(next_worker.add_task(next_payload))
+            elif task_id:
+                from ..db import TaskStatus
+                from ..task_updater import update_and_notify
+                self._submit_coro(update_and_notify(
+                    task_id,
+                    {
+                        "status": TaskStatus.FAILED,
+                        "error_message": "当前未启用模型语音识别（ASR），无法继续音频转录流程。",
+                    },
+                ))
 
         except TaskCancelledError as e:
             logger.info(f"[{self.name}] {e}")

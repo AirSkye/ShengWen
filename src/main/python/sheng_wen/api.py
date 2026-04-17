@@ -202,6 +202,7 @@ class TranscriptionSettings(BaseModel):
     cuda_reason: str
     cuda_message: str
     enable_bilibili_subtitle_fetch: bool
+    enable_asr_transcription: bool
     has_bilibili_sessdata: bool
     bilibili_cookie_source: str
     bilibili_sessdata_masked: str
@@ -215,6 +216,10 @@ class TranscriptionSettingsUpdate(BaseModel):
     enable_bilibili_subtitle_fetch: Optional[bool] = Field(
         default=None,
         description="是否优先尝试直取 B 站字幕（失败时回退 ASR）"
+    )
+    enable_asr_transcription: Optional[bool] = Field(
+        default=None,
+        description="是否允许回退到模型语音识别（ASR）。关闭后仅允许字幕来源。",
     )
     bilibili_sessdata: Optional[str] = Field(
         default=None,
@@ -412,6 +417,7 @@ initial_transcription_device = str(whisper_cfg.device).lower()
 if initial_transcription_device not in {"cpu", "cuda"}:
     initial_transcription_device = "cpu"
 initial_enable_bilibili_subtitle_fetch = bool(whisper_cfg.enable_bilibili_subtitle_fetch)
+initial_enable_asr_transcription = bool(getattr(whisper_cfg, "enable_asr_transcription", False))
 initial_bilibili_sessdata = str(whisper_cfg.bilibili_sessdata or "")
 
 transcription_settings_manager = TranscriptionSettingsManager(
@@ -420,6 +426,7 @@ transcription_settings_manager = TranscriptionSettingsManager(
     model_size=whisper_cfg.model_size,
     model_path=whisper_cfg.configured_model_path,
     initial_enable_bilibili_subtitle_fetch=initial_enable_bilibili_subtitle_fetch,
+    initial_enable_asr_transcription=initial_enable_asr_transcription,
     initial_bilibili_sessdata=initial_bilibili_sessdata,
 )
 llm_provider_manager = LLMProviderManager(
@@ -453,6 +460,8 @@ async def get_transcriber_worker():
     global transcriber_worker
     if transcriber_worker is not None:
         return transcriber_worker
+    if not _is_asr_transcription_enabled():
+        raise ModelLoadError("当前未开启模型语音识别（ASR），请在转录设置中手动开启后再使用音频转录。")
 
     from .transcriber.transcriber import get_transcriber
     from .transcriber.transcriber_worker import TranscriberWorker
@@ -486,12 +495,12 @@ async def get_downloader_worker():
 
     from .downloader.video_downloader_worker import VideoDownloaderWorker
 
-    transcriber_w = await get_transcriber_worker()
     llm_w = await get_llm_worker()
 
     downloader_worker = VideoDownloaderWorker(
         name="VideoDownloaderWorker",
-        next_worker=transcriber_w,
+        next_worker=None,
+        transcriber_worker_factory=get_transcriber_worker,
         summary_worker=llm_w,
         transcription_settings_manager=transcription_settings_manager,
     )
@@ -589,6 +598,14 @@ def _normalize_summary_mode(raw_value: str | None, fallback: str | None = None) 
     if fb in VALID_SUMMARY_MODES:
         return fb
     return _resolve_default_summary_mode()
+
+
+def _is_asr_transcription_enabled() -> bool:
+    try:
+        settings = transcription_settings_manager.get_settings()
+        return bool(settings.get("enable_asr_transcription", False))
+    except Exception:
+        return False
 
 
 def _normalize_task_title(title: str | None, fallback: str) -> str:
@@ -736,6 +753,9 @@ async def upload_file(
     """
     接收上传的视频/音频文件
     """
+    if not _is_asr_transcription_enabled():
+        raise HTTPException(status_code=400, detail="当前未开启模型语音识别（ASR），仅支持字幕来源任务。")
+
     # 验证文件类型
     file_ext = os.path.splitext(file.filename)[1].lower() if file.filename else ''
 
@@ -901,6 +921,8 @@ async def upload_local_path(payload: LocalPathTaskCreate, request: Request):
             status_code=403,
             detail="仅允许本机 localhost 请求使用本地路径直读。"
         )
+    if not _is_asr_transcription_enabled():
+        raise HTTPException(status_code=400, detail="当前未开启模型语音识别（ASR），仅支持字幕来源任务。")
 
     raw_path = (payload.file_path or "").strip().strip('"')
     if not raw_path:
@@ -1593,6 +1615,7 @@ async def update_transcription_settings(payload: TranscriptionSettingsUpdate):
             model_size=payload.model_size,
             model_path=payload.model_path,
             enable_bilibili_subtitle_fetch=payload.enable_bilibili_subtitle_fetch,
+            enable_asr_transcription=payload.enable_asr_transcription,
             bilibili_sessdata=payload.bilibili_sessdata,
             clear_bilibili_sessdata=payload.clear_bilibili_sessdata,
         )
@@ -1743,3 +1766,8 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
+    if not _is_asr_transcription_enabled():
+        raise HTTPException(status_code=400, detail="当前未开启模型语音识别（ASR），仅支持字幕来源任务。")
+
+    if not _is_asr_transcription_enabled():
+        raise HTTPException(status_code=400, detail="当前未开启模型语音识别（ASR），仅支持字幕来源任务。")

@@ -55,6 +55,7 @@ class WhisperConfig:
     model_size: Literal["tiny", "base", "small", "medium", "large"] = "tiny"
     device: Literal["cpu", "cuda"] = "cpu"
     enable_bilibili_subtitle_fetch: bool = True
+    enable_asr_transcription: bool = False
     bilibili_sessdata: str = ""
     faster_whisper_model_path: str | None = None
 
@@ -292,6 +293,8 @@ class JSONConfigManager:
             whisper_patch["faster_whisper_model_path"] = None
         if "enable_bilibili_subtitle_fetch" in payload:
             whisper_patch["enable_bilibili_subtitle_fetch"] = bool(payload["enable_bilibili_subtitle_fetch"])
+        if "enable_asr_transcription" in payload:
+            whisper_patch["enable_asr_transcription"] = bool(payload["enable_asr_transcription"])
         if "bilibili_sessdata" in payload:
             whisper_patch["bilibili_sessdata"] = str(payload.get("bilibili_sessdata") or "")
         if whisper_patch:
@@ -375,6 +378,9 @@ class JSONConfigManager:
             device=device,  # type: ignore[arg-type]
             enable_bilibili_subtitle_fetch=bool(
                 raw.get("enable_bilibili_subtitle_fetch", defaults["enable_bilibili_subtitle_fetch"])
+            ),
+            enable_asr_transcription=bool(
+                raw.get("enable_asr_transcription", defaults["enable_asr_transcription"])
             ),
             bilibili_sessdata=str(raw.get("bilibili_sessdata", defaults["bilibili_sessdata"]) or ""),
             faster_whisper_model_path=faster_whisper_model_path,
@@ -508,5 +514,4 @@ def to_llm_config(settings: Settings) -> "LLMConfigDataclass":
         context_window_size=llm_cfg.context_window_size,
         provider=llm_cfg.provider,
     )
-
 

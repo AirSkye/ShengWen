@@ -13,6 +13,7 @@
     "model_size": "tiny",
     "device": "cpu",
     "enable_bilibili_subtitle_fetch": true,
+    "enable_asr_transcription": false,
     "bilibili_sessdata": "",
     "faster_whisper_model_path": null
   },
