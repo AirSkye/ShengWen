@@ -33,7 +33,11 @@ const {
   tasks,
   selectedTask,
   videoUrl,
+  taskTitle,
   selectedFile,
+  selectedSubtitleFile,
+  subtitleText,
+  inputSourceMode,
   localFilePath,
   isLocalClient,
   quality,
@@ -758,7 +762,11 @@ watch(
     <!-- 左侧边栏 -->
     <Sidebar
       v-model:videoUrl="videoUrl"
+      v-model:taskTitle="taskTitle"
       v-model:selectedFile="selectedFile"
+      v-model:selectedSubtitleFile="selectedSubtitleFile"
+      v-model:subtitleText="subtitleText"
+      v-model:inputSourceMode="inputSourceMode"
       v-model:localFilePath="localFilePath"
       v-model:quality="quality"
       v-model:summaryMode="summaryMode"
@@ -918,4 +926,3 @@ watch(
 /* 移动端点击高亮优化 */
 html, body { -webkit-tap-highlight-color: transparent; }
 </style>
-

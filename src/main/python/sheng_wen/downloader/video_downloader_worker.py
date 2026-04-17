@@ -387,6 +387,7 @@ class VideoDownloaderWorker(Worker):
     def _try_process_with_bilibili_subtitle(self, payload: Dict[str, Any]) -> bool:
         video_url = str(payload.get("video_url") or "")
         task_id = payload.get("task_id")
+        subtitle_only = bool(payload.get("subtitle_only"))
 
         if not video_url or not task_id:
             return False
@@ -425,13 +426,22 @@ class VideoDownloaderWorker(Worker):
 
         logger.info(
             f"[{self.name}] 检测到 B 站 URL，尝试使用 bilibili-api 直取字幕: {video_url}"
-            f" (cookie_source={cookie_source}, has_cookie={bool(sessdata)})"
+            f" (cookie_source={cookie_source}, has_cookie={bool(sessdata)}, subtitle_only={subtitle_only})"
         )
 
         try:
             subtitle_result = self._try_extract_bilibili_subtitle(video_url, sessdata)
             if not subtitle_result:
-                logger.info(f"[{self.name}] 未获取到可用字幕，回退到下载+ASR流程。")
+                logger.warning(f"[{self.name}] 未获取到可用字幕。")
+                if subtitle_only and task_id:
+                    from ..db import TaskStatus
+                    from ..task_updater import update_and_notify
+                    self._submit_coro(update_and_notify(
+                        task_id,
+                        {"status": TaskStatus.FAILED, "error_message": "未获取到可用 B 站字幕，任务已终止（当前模式不回退 ASR）。"},
+                    ))
+                    return True
+                logger.info(f"[{self.name}] 回退到下载+ASR流程。")
                 return False
 
             transcript = subtitle_result["transcript"]
@@ -478,7 +488,16 @@ class VideoDownloaderWorker(Worker):
             )
             return True
         except Exception as e:
-            logger.warning(f"[{self.name}] B 站字幕直取失败，将回退 ASR: {e}")
+            logger.warning(f"[{self.name}] B 站字幕直取失败: {e}")
+            if subtitle_only and task_id:
+                from ..db import TaskStatus
+                from ..task_updater import update_and_notify
+                self._submit_coro(update_and_notify(
+                    task_id,
+                    {"status": TaskStatus.FAILED, "error_message": f"B站字幕提取失败，任务已终止（不回退 ASR）: {e}"},
+                ))
+                return True
+            logger.warning(f"[{self.name}] 将回退 ASR。")
             return False
 
     def _try_process_bilibili_multi_part_merge(

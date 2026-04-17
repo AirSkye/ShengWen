@@ -37,7 +37,11 @@ import {
 import ThemeSelector from './ThemeSelector.vue'
 
 const videoUrl = defineModel<string>('videoUrl', { required: true })
+const taskTitle = defineModel<string>('taskTitle', { default: '' })
 const selectedFile = defineModel<File | null>('selectedFile', { default: null })
+const selectedSubtitleFile = defineModel<File | null>('selectedSubtitleFile', { default: null })
+const subtitleText = defineModel<string>('subtitleText', { default: '' })
+const inputSourceMode = defineModel<'bilibili' | 'subtitle'>('inputSourceMode', { default: 'bilibili' })
 const localFilePath = defineModel<string>('localFilePath', { default: '' })
 // const quality = defineModel<string>('quality', { required: true })
 const summaryMode = defineModel<Exclude<SummaryMode, 'auto'>>('summaryMode', { default: 'standard' })
@@ -101,6 +105,7 @@ const emit = defineEmits<{
 }>()
 
 const fileInput = ref<HTMLInputElement | null>(null)
+const subtitleFileInput = ref<HTMLInputElement | null>(null)
 const isSettingsPanelOpen = ref(false)
 const settingsTab = ref<'llm' | 'transcription' | 'summarization'>('llm')
 const sidebarTab = ref<'quick' | 'manage' | 'theme'>('quick')
@@ -163,6 +168,9 @@ type SearchMatchSource = 'topic' | 'summary'
 const triggerFileUpload = () => {
   fileInput.value?.click()
 }
+const triggerSubtitleFileUpload = () => {
+  subtitleFileInput.value?.click()
+}
 
 const switchSummaryMode = (mode: Exclude<SummaryMode, 'auto'>) => {
   summaryMode.value = mode
@@ -195,7 +203,20 @@ const handleFileChange = (event: Event) => {
     // 清空 URL 输入框（互斥模式）
     videoUrl.value = ''
     localFilePath.value = ''
+    inputSourceMode.value = 'bilibili'
     selectedFile.value = file
+  }
+}
+
+const handleSubtitleFileChange = (event: Event) => {
+  const target = event.target as HTMLInputElement
+  const file = target.files?.[0]
+  if (file) {
+    selectedSubtitleFile.value = file
+    inputSourceMode.value = 'subtitle'
+    selectedFile.value = null
+    localFilePath.value = ''
+    videoUrl.value = ''
   }
 }
 
@@ -1129,14 +1150,49 @@ watch(() => props.summarizationSettings, (settings) => {
           <!-- 提交新任务 -->
           <div class="p-3 pb-2">
             <div class="space-y-2.5">
+              <div class="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  @click="inputSourceMode = 'bilibili'"
+                  :class="[
+                    'px-3 py-2 rounded-lg border text-xs font-medium transition-colors',
+                    inputSourceMode === 'bilibili'
+                      ? 'border-blue-300 bg-blue-50 text-blue-700'
+                      : 'border-gray-200 bg-gray-50 text-slate-600'
+                  ]"
+                >
+                  B站字幕
+                </button>
+                <button
+                  type="button"
+                  @click="inputSourceMode = 'subtitle'; videoUrl = ''; selectedFile = null; localFilePath = ''"
+                  :class="[
+                    'px-3 py-2 rounded-lg border text-xs font-medium transition-colors',
+                    inputSourceMode === 'subtitle'
+                      ? 'border-blue-300 bg-blue-50 text-blue-700'
+                      : 'border-gray-200 bg-gray-50 text-slate-600'
+                  ]"
+                >
+                  上传/粘贴字幕
+                </button>
+              </div>
+
+              <input
+                v-model="taskTitle"
+                type="text"
+                placeholder="请输入任务标题（必填，展示名）"
+                class="w-full px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
+              >
+
               <div class="relative">
                 <PhLink :size="18" class="absolute left-3 top-3 text-slate-400" />
                 <input
                   v-model="videoUrl"
                   type="text"
-                  placeholder="粘贴视频 URL (如 Bilibili)"
+                  placeholder="粘贴 B 站视频 URL"
                   class="w-full pl-10 pr-12 py-2.5 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
-                  @input="selectedFile = null; localFilePath = ''"
+                  :disabled="inputSourceMode !== 'bilibili'"
+                  @input="selectedFile = null; localFilePath = ''; inputSourceMode = 'bilibili'"
                   @keydown.enter.prevent="handleVideoUrlEnter"
                 >
                 <button
@@ -1155,6 +1211,34 @@ watch(() => props.summarizationSettings, (settings) => {
                   class="hidden"
                   @change="handleFileChange"
                 >
+              </div>
+
+              <div v-if="inputSourceMode === 'subtitle'" class="space-y-2">
+                <div class="flex items-center gap-2">
+                  <button
+                    type="button"
+                    @click="triggerSubtitleFileUpload"
+                    class="px-3 py-2 rounded-lg border border-gray-200 bg-gray-50 hover:bg-gray-100 text-xs text-slate-700"
+                  >
+                    上传字幕文件(.txt/.srt/.vtt)
+                  </button>
+                  <input
+                    ref="subtitleFileInput"
+                    type="file"
+                    accept=".txt,.srt,.vtt,text/plain"
+                    class="hidden"
+                    @change="handleSubtitleFileChange"
+                  >
+                  <span v-if="selectedSubtitleFile" class="text-xs text-slate-500 truncate">
+                    {{ selectedSubtitleFile.name }}
+                  </span>
+                </div>
+                <textarea
+                  v-model="subtitleText"
+                  rows="5"
+                  placeholder="也可以直接粘贴字幕文本（支持无时间戳纯文本）"
+                  class="w-full px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
+                />
               </div>
 
               <div
@@ -1255,7 +1339,7 @@ watch(() => props.summarizationSettings, (settings) => {
 
               <button
                 @click="handleSubmitAction"
-                :disabled="!isSubmitting && (!videoUrl && (!props.isLocalClient ? !selectedFile : !localFilePath))"
+                :disabled="!isSubmitting && (inputSourceMode === 'subtitle' ? (!selectedSubtitleFile && !subtitleText.trim()) : (!videoUrl && (!props.isLocalClient ? !selectedFile : !localFilePath)))"
                 class="w-full bg-primary hover:bg-secondary text-white py-2.5 rounded-xl font-semibold transition-all shadow-sm shadow-blue-100 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed active:scale-95"
               >
                 <PhSpinner v-if="isSubmitting" :size="18" class="animate-spin" />
@@ -1499,4 +1583,3 @@ watch(() => props.summarizationSettings, (settings) => {
   animation: aurora-flow 12s ease-in-out infinite;
 }
 </style>
-
