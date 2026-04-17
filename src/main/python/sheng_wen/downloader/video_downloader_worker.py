@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import uuid
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -21,15 +22,44 @@ class VideoDownloaderWorker(Worker):
         self,
         name: str,
         next_worker: Worker = None,
+        transcriber_worker_factory: Any = None,
         summary_worker: Worker = None,
         transcription_settings_manager: Any = None
     ):
         super().__init__(name)
         self.next_worker = next_worker
+        self.transcriber_worker_factory = transcriber_worker_factory
         self.summary_worker = summary_worker
         self.transcription_settings_manager = transcription_settings_manager
         self.output_dir = "temp"
         os.makedirs(self.output_dir, exist_ok=True)
+
+    def _asr_enabled(self) -> bool:
+        manager = self.transcription_settings_manager
+        if manager is None:
+            return False
+        try:
+            settings = manager.get_settings()
+            return bool(settings.get("enable_asr_transcription", False))
+        except Exception as e:
+            logger.warning(f"[{self.name}] 读取 ASR 开关失败，默认关闭: {e}")
+            return False
+
+    def _resolve_transcriber_worker_if_needed(self) -> Worker | None:
+        if self.next_worker is not None:
+            return self.next_worker
+        if not self._asr_enabled():
+            return None
+        if not self.transcriber_worker_factory or not self._loop:
+            return None
+        try:
+            future = asyncio.run_coroutine_threadsafe(self.transcriber_worker_factory(), self._loop)
+            self.next_worker = future.result(timeout=30)
+            logger.info(f"[{self.name}] 已按需初始化转录 worker（ASR 已开启）。")
+            return self.next_worker
+        except Exception as e:
+            logger.error(f"[{self.name}] 按需初始化转录 worker 失败: {e}", exc_info=True)
+            return None
 
     @staticmethod
     def _is_bilibili_url(video_url: str) -> bool:
@@ -142,6 +172,34 @@ class VideoDownloaderWorker(Worker):
         if env_cookie:
             return env_cookie, "env"
         return "", "none"
+
+    @staticmethod
+    def _normalize_download_url(video_url: str) -> str:
+        try:
+            parsed = urlparse(video_url)
+            netloc = (parsed.netloc or "").lower()
+            if "bilibili.com" in netloc:
+                # 移除无关追踪参数，降低 412 风险；分P由 payload.bilibili_parts 管理。
+                return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            return video_url
+        except Exception:
+            return video_url
+
+    @staticmethod
+    def _write_temp_bilibili_cookie_file(sessdata: str) -> str:
+        if not sessdata:
+            return ""
+        os.makedirs("temp", exist_ok=True)
+        cookie_path = os.path.join("temp", f"bilibili_cookie_{uuid.uuid4().hex}.txt")
+        now = int(time.time()) + 30 * 24 * 3600
+        # Netscape cookie format: domain, include_subdomains, path, secure, expires, name, value
+        lines = [
+            "# Netscape HTTP Cookie File",
+            f".bilibili.com\tTRUE\t/\tTRUE\t{now}\tSESSDATA\t{sessdata}",
+        ]
+        with open(cookie_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return cookie_path
 
     @staticmethod
     def _download_text(url: str, extra_headers: Dict[str, Any] | None = None) -> str:
@@ -387,6 +445,7 @@ class VideoDownloaderWorker(Worker):
     def _try_process_with_bilibili_subtitle(self, payload: Dict[str, Any]) -> bool:
         video_url = str(payload.get("video_url") or "")
         task_id = payload.get("task_id")
+        subtitle_only = bool(payload.get("subtitle_only"))
 
         if not video_url or not task_id:
             return False
@@ -425,13 +484,22 @@ class VideoDownloaderWorker(Worker):
 
         logger.info(
             f"[{self.name}] 检测到 B 站 URL，尝试使用 bilibili-api 直取字幕: {video_url}"
-            f" (cookie_source={cookie_source}, has_cookie={bool(sessdata)})"
+            f" (cookie_source={cookie_source}, has_cookie={bool(sessdata)}, subtitle_only={subtitle_only})"
         )
 
         try:
             subtitle_result = self._try_extract_bilibili_subtitle(video_url, sessdata)
             if not subtitle_result:
-                logger.info(f"[{self.name}] 未获取到可用字幕，回退到下载+ASR流程。")
+                logger.warning(f"[{self.name}] 未获取到可用字幕。")
+                if subtitle_only and task_id:
+                    from ..db import TaskStatus
+                    from ..task_updater import update_and_notify
+                    self._submit_coro(update_and_notify(
+                        task_id,
+                        {"status": TaskStatus.FAILED, "error_message": "未获取到可用 B 站字幕，任务已终止（当前模式不回退 ASR）。"},
+                    ))
+                    return True
+                logger.info(f"[{self.name}] 回退到下载+ASR流程。")
                 return False
 
             transcript = subtitle_result["transcript"]
@@ -478,7 +546,16 @@ class VideoDownloaderWorker(Worker):
             )
             return True
         except Exception as e:
-            logger.warning(f"[{self.name}] B 站字幕直取失败，将回退 ASR: {e}")
+            logger.warning(f"[{self.name}] B 站字幕直取失败: {e}")
+            if subtitle_only and task_id:
+                from ..db import TaskStatus
+                from ..task_updater import update_and_notify
+                self._submit_coro(update_and_notify(
+                    task_id,
+                    {"status": TaskStatus.FAILED, "error_message": f"B站字幕提取失败，任务已终止（不回退 ASR）: {e}"},
+                ))
+                return True
+            logger.warning(f"[{self.name}] 将回退 ASR。")
             return False
 
     def _try_process_bilibili_multi_part_merge(
@@ -621,11 +698,27 @@ class VideoDownloaderWorker(Worker):
 
             if self._try_process_with_bilibili_subtitle(payload):
                 return
+            if not self._asr_enabled():
+                if task_id:
+                    from ..db import TaskStatus
+                    from ..task_updater import update_and_notify
+                    self._submit_coro(update_and_notify(
+                        task_id,
+                        {
+                            "status": TaskStatus.FAILED,
+                            "error_message": "当前未开启模型语音识别（ASR），且未获取到可用字幕，任务已终止。",
+                        },
+                    ))
+                logger.warning(f"[{self.name}] task={task_id} 未取到字幕且 ASR 关闭，终止任务。")
+                return
         except TaskCancelledError as e:
             logger.info(f"[{self.name}] {e}")
             return
 
-        logger.info(f"[{self.name}] 开始下载视频: {video_url} (质量: {quality})")
+        normalized_video_url = self._normalize_download_url(str(video_url))
+        logger.info(
+            f"[{self.name}] 开始下载视频: original={video_url}, normalized={normalized_video_url}, 质量={quality}"
+        )
 
         if task_id:
             from ..db import TaskStatus
@@ -655,10 +748,12 @@ class VideoDownloaderWorker(Worker):
                 except ValueError:
                     logger.warning(f"[{self.name}] 无法从 yt-dlp 解析进度: '{p}' (原始值: '{raw_p}')")
 
+        cookie_path = ""
         try:
             # 配置 ffmpeg 路径（使用 FFmpegHelper）
             ffmpeg_location = FFmpegHelper.get_yt_dlp_ffmpeg_location()
-            
+            bilibili_sessdata, cookie_source = self._resolve_bilibili_sessdata(payload)
+
             if quality == "audio_only":
                 ydl_opts = {
                     'outtmpl': os.path.join(self.output_dir, '%(id)s.%(ext)s'),
@@ -674,13 +769,33 @@ class VideoDownloaderWorker(Worker):
                     'merge_output_format': 'mp4',
                     'progress_hooks': [progress_hook],
                 }
+
+            # 增强 B 站下载稳定性
+            ydl_opts['http_headers'] = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                              '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Referer': 'https://www.bilibili.com/',
+                'Origin': 'https://www.bilibili.com',
+            }
+            ydl_opts['extractor_retries'] = 3
+            ydl_opts['retries'] = 3
+            ydl_opts['fragment_retries'] = 3
+            ydl_opts['sleep_interval_requests'] = 0.5
+            ydl_opts['nocheckcertificate'] = True
+            if self._is_bilibili_url(str(normalized_video_url)) and bilibili_sessdata:
+                cookie_path = self._write_temp_bilibili_cookie_file(bilibili_sessdata)
+                if cookie_path:
+                    ydl_opts['cookiefile'] = cookie_path
+                    logger.info(
+                        f"[{self.name}] 已附加 B 站登录 Cookie 到下载请求: source={cookie_source}, cookiefile={cookie_path}"
+                    )
             
             # 如果有 ffmpeg 路径，添加到配置中
             if ffmpeg_location:
                 ydl_opts['ffmpeg_location'] = ffmpeg_location
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info_dict = ydl.extract_info(video_url, download=True)
+                info_dict = ydl.extract_info(normalized_video_url, download=True)
                 video_path = ydl.prepare_filename(info_dict)
 
             logger.info(f"[{self.name}] 视频下载成功: {video_path}")
@@ -701,14 +816,25 @@ class VideoDownloaderWorker(Worker):
                 from ..task_updater import update_and_notify
                 self._submit_coro(update_and_notify(task_id, {"status": TaskStatus.TRANSCRIBING}))
 
-            if self.next_worker:
+            next_worker = self._resolve_transcriber_worker_if_needed()
+            if next_worker:
                 next_payload = payload.copy()
                 next_payload['video_file'] = video_path
                 base_name = os.path.splitext(os.path.basename(video_path))[0]
                 next_payload['audio_file'] = os.path.join(self.output_dir, f"{base_name}.mp3")
                 next_payload['output_file'] = os.path.join(self.output_dir, f"{base_name}_summary.md")
                 
-                self._submit_coro(self.next_worker.add_task(next_payload))
+                self._submit_coro(next_worker.add_task(next_payload))
+            elif task_id:
+                from ..db import TaskStatus
+                from ..task_updater import update_and_notify
+                self._submit_coro(update_and_notify(
+                    task_id,
+                    {
+                        "status": TaskStatus.FAILED,
+                        "error_message": "当前未启用模型语音识别（ASR），无法继续音频转录流程。",
+                    },
+                ))
 
         except TaskCancelledError as e:
             logger.info(f"[{self.name}] {e}")
@@ -719,4 +845,15 @@ class VideoDownloaderWorker(Worker):
                 from ..task_updater import update_and_notify
                 # 清理错误信息中的 ANSI 转义序列
                 clean_error = re.sub(r'\x1B(?:[@-Z\-_]|\[[0-?]*[ -/]*[@-~])', '', str(e))
+                if "HTTP Error 412" in clean_error:
+                    clean_error = (
+                        "B站下载触发 412（风控拦截）。请在“转录设置”中填写有效 SESSDATA，"
+                        "或切换为仅字幕总结模式。原始错误: " + clean_error
+                    )
                 self._submit_coro(update_and_notify(task_id, {"status": TaskStatus.FAILED, "error_message": clean_error}))
+        finally:
+            if cookie_path and os.path.exists(cookie_path):
+                try:
+                    os.remove(cookie_path)
+                except OSError:
+                    pass
