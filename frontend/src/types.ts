@@ -37,7 +37,10 @@ export interface CreateTaskRequest {
   video_url: string;
   quality: string;
   summary_mode?: Exclude<SummaryMode, 'auto'> | SummaryMode;
+  title?: string;
 }
+
+export interface CreateSubtitleTaskResponse extends Task {}
 
 export interface MarkdownHeadingItem {
   id: string;
