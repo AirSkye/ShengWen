@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import uuid
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -171,6 +172,34 @@ class VideoDownloaderWorker(Worker):
         if env_cookie:
             return env_cookie, "env"
         return "", "none"
+
+    @staticmethod
+    def _normalize_download_url(video_url: str) -> str:
+        try:
+            parsed = urlparse(video_url)
+            netloc = (parsed.netloc or "").lower()
+            if "bilibili.com" in netloc:
+                # 移除无关追踪参数，降低 412 风险；分P由 payload.bilibili_parts 管理。
+                return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+            return video_url
+        except Exception:
+            return video_url
+
+    @staticmethod
+    def _write_temp_bilibili_cookie_file(sessdata: str) -> str:
+        if not sessdata:
+            return ""
+        os.makedirs("temp", exist_ok=True)
+        cookie_path = os.path.join("temp", f"bilibili_cookie_{uuid.uuid4().hex}.txt")
+        now = int(time.time()) + 30 * 24 * 3600
+        # Netscape cookie format: domain, include_subdomains, path, secure, expires, name, value
+        lines = [
+            "# Netscape HTTP Cookie File",
+            f".bilibili.com\tTRUE\t/\tTRUE\t{now}\tSESSDATA\t{sessdata}",
+        ]
+        with open(cookie_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return cookie_path
 
     @staticmethod
     def _download_text(url: str, extra_headers: Dict[str, Any] | None = None) -> str:
@@ -686,7 +715,10 @@ class VideoDownloaderWorker(Worker):
             logger.info(f"[{self.name}] {e}")
             return
 
-        logger.info(f"[{self.name}] 开始下载视频: {video_url} (质量: {quality})")
+        normalized_video_url = self._normalize_download_url(str(video_url))
+        logger.info(
+            f"[{self.name}] 开始下载视频: original={video_url}, normalized={normalized_video_url}, 质量={quality}"
+        )
 
         if task_id:
             from ..db import TaskStatus
@@ -716,10 +748,12 @@ class VideoDownloaderWorker(Worker):
                 except ValueError:
                     logger.warning(f"[{self.name}] 无法从 yt-dlp 解析进度: '{p}' (原始值: '{raw_p}')")
 
+        cookie_path = ""
         try:
             # 配置 ffmpeg 路径（使用 FFmpegHelper）
             ffmpeg_location = FFmpegHelper.get_yt_dlp_ffmpeg_location()
-            
+            bilibili_sessdata, cookie_source = self._resolve_bilibili_sessdata(payload)
+
             if quality == "audio_only":
                 ydl_opts = {
                     'outtmpl': os.path.join(self.output_dir, '%(id)s.%(ext)s'),
@@ -735,13 +769,33 @@ class VideoDownloaderWorker(Worker):
                     'merge_output_format': 'mp4',
                     'progress_hooks': [progress_hook],
                 }
+
+            # 增强 B 站下载稳定性
+            ydl_opts['http_headers'] = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                              '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+                'Referer': 'https://www.bilibili.com/',
+                'Origin': 'https://www.bilibili.com',
+            }
+            ydl_opts['extractor_retries'] = 3
+            ydl_opts['retries'] = 3
+            ydl_opts['fragment_retries'] = 3
+            ydl_opts['sleep_interval_requests'] = 0.5
+            ydl_opts['nocheckcertificate'] = True
+            if self._is_bilibili_url(str(normalized_video_url)) and bilibili_sessdata:
+                cookie_path = self._write_temp_bilibili_cookie_file(bilibili_sessdata)
+                if cookie_path:
+                    ydl_opts['cookiefile'] = cookie_path
+                    logger.info(
+                        f"[{self.name}] 已附加 B 站登录 Cookie 到下载请求: source={cookie_source}, cookiefile={cookie_path}"
+                    )
             
             # 如果有 ffmpeg 路径，添加到配置中
             if ffmpeg_location:
                 ydl_opts['ffmpeg_location'] = ffmpeg_location
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info_dict = ydl.extract_info(video_url, download=True)
+                info_dict = ydl.extract_info(normalized_video_url, download=True)
                 video_path = ydl.prepare_filename(info_dict)
 
             logger.info(f"[{self.name}] 视频下载成功: {video_path}")
@@ -791,4 +845,15 @@ class VideoDownloaderWorker(Worker):
                 from ..task_updater import update_and_notify
                 # 清理错误信息中的 ANSI 转义序列
                 clean_error = re.sub(r'\x1B(?:[@-Z\-_]|\[[0-?]*[ -/]*[@-~])', '', str(e))
+                if "HTTP Error 412" in clean_error:
+                    clean_error = (
+                        "B站下载触发 412（风控拦截）。请在“转录设置”中填写有效 SESSDATA，"
+                        "或切换为仅字幕总结模式。原始错误: " + clean_error
+                    )
                 self._submit_coro(update_and_notify(task_id, {"status": TaskStatus.FAILED, "error_message": clean_error}))
+        finally:
+            if cookie_path and os.path.exists(cookie_path):
+                try:
+                    os.remove(cookie_path)
+                except OSError:
+                    pass
