@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { PhInfo, PhX, PhArrowSquareOut } from '@phosphor-icons/vue'
 import { TaskStatus, type Task } from '../types'
+import { isLinkableSource } from '../utils/formatters'
 
 const show = defineModel<boolean>('show', { required: true })
 
@@ -60,9 +61,10 @@ const getStatusClass = (status: TaskStatus) => {
 
             <div class="text-slate-500">视频 URL</div>
             <div class="text-slate-800 truncate" :title="selectedTask.video_url">
-              <a :href="selectedTask.video_url" target="_blank" class="text-primary hover:underline flex items-center gap-1">
+              <a v-if="isLinkableSource(selectedTask.video_url)" :href="selectedTask.video_url" target="_blank" class="text-primary hover:underline flex items-center gap-1">
                 链接 <PhArrowSquareOut :size="12" />
               </a>
+              <span v-else>{{ selectedTask.video_url }}</span>
             </div>
 
             <template v-if="selectedTask.audio_duration">

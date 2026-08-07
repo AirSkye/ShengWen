@@ -29,6 +29,8 @@ venv
 .env
 .env.local
 config/settings.json
+tingwu/config.json
+tingwu/temp/
 scripts/fetch_subtitle/.bilibili_cookie.env
 .claude/settings.local
 

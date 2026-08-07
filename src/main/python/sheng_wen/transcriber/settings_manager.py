@@ -11,6 +11,59 @@ from ..utils.logger import logger
 from .transcriber import get_transcriber
 
 
+class _YtDlpCookieLogger:
+    def __init__(self, browser_name: str):
+        self.browser_name = browser_name
+
+    def debug(self, message: str):
+        logger.debug(f"[TranscriptionSettingsManager] yt-dlp {self.browser_name}: {message}")
+
+    def info(self, message: str):
+        logger.debug(f"[TranscriptionSettingsManager] yt-dlp {self.browser_name}: {message}")
+
+    def warning(self, message: str):
+        logger.debug(f"[TranscriptionSettingsManager] yt-dlp {self.browser_name}: {message}")
+
+    def error(self, message: str):
+        logger.debug(f"[TranscriptionSettingsManager] yt-dlp {self.browser_name}: {message}")
+
+
+def _find_bilibili_sessdata(cookies: Any) -> str:
+    for cookie in cookies:
+        domain = str(getattr(cookie, "domain", "") or "")
+        name = str(getattr(cookie, "name", "") or "")
+        value = _sanitize_cookie_value(str(getattr(cookie, "value", "") or ""))
+        if name == "SESSDATA" and value and "bilibili.com" in domain.lower():
+            return value
+    return ""
+
+
+def _read_bilibili_cookie_with_ytdlp(browser_key: str, browser_name: str) -> tuple[str, str]:
+    try:
+        from yt_dlp import cookies as yt_dlp_cookies  # type: ignore
+    except ImportError:
+        logger.debug("[TranscriptionSettingsManager] yt-dlp 未安装，跳过备用浏览器 Cookie 读取")
+        return "", ""
+
+    supported_browsers = getattr(yt_dlp_cookies, "SUPPORTED_BROWSERS", set())
+    if supported_browsers and browser_key not in supported_browsers:
+        return "", ""
+
+    try:
+        cookie_jar = yt_dlp_cookies.extract_cookies_from_browser(
+            browser_key,
+            logger=_YtDlpCookieLogger(browser_name),
+        )
+        sessdata = _find_bilibili_sessdata(cookie_jar)
+        if sessdata:
+            logger.info(f"[TranscriptionSettingsManager] 成功通过 yt-dlp 从 {browser_name} 读取 B 站 Cookie")
+            return sessdata, f"{browser_name} (yt-dlp)"
+    except Exception as e:
+        logger.debug(f"[TranscriptionSettingsManager] yt-dlp 从 {browser_name} 读取失败: {e}")
+
+    return "", ""
+
+
 def _read_bilibili_cookie_from_browser() -> tuple[str, str]:
     """
     尝试从浏览器中读取 B 站 SESSDATA。
@@ -31,28 +84,28 @@ def _read_bilibili_cookie_from_browser() -> tuple[str, str]:
         import browser_cookie3  # type: ignore
     except ImportError:
         logger.warning("[TranscriptionSettingsManager] browser_cookie3 未安装，无法从浏览器读取 Cookie")
-        return "", ""
+        browser_cookie3 = None
 
     for browser_key, browser_name in browsers_to_try:
-        try:
-            browser_func = getattr(browser_cookie3, browser_key, None)
-            if browser_func is None:
-                continue
+        if browser_cookie3 is not None:
+            try:
+                browser_func = getattr(browser_cookie3, browser_key, None)
+                if browser_func is None:
+                    continue
 
-            cookies = browser_func(domain_name="bilibili.com")
-            for cookie in cookies:
-                if cookie.name == "SESSDATA" and cookie.value:
-                    sessdata = _sanitize_cookie_value(cookie.value)
-                    if sessdata:
-                        logger.info(f"[TranscriptionSettingsManager] 成功从 {browser_name} 读取 B 站 Cookie")
-                        return sessdata, browser_name
-        except PermissionError:
-            # 浏览器正在运行时会触发此错误，跳过该浏览器
-            logger.debug(f"[TranscriptionSettingsManager] {browser_name} 正在运行，跳过读取")
-            continue
-        except Exception as e:
-            logger.debug(f"[TranscriptionSettingsManager] 从 {browser_name} 读取失败: {e}")
-            continue
+                cookies = browser_func(domain_name="bilibili.com")
+                sessdata = _find_bilibili_sessdata(cookies)
+                if sessdata:
+                    logger.info(f"[TranscriptionSettingsManager] 成功从 {browser_name} 读取 B 站 Cookie")
+                    return sessdata, browser_name
+            except PermissionError:
+                logger.debug(f"[TranscriptionSettingsManager] {browser_name} 正在运行，尝试备用读取")
+            except Exception as e:
+                logger.debug(f"[TranscriptionSettingsManager] 从 {browser_name} 读取失败: {e}")
+
+        sessdata, source = _read_bilibili_cookie_with_ytdlp(browser_key, browser_name)
+        if sessdata:
+            return sessdata, source
 
     return "", ""
 
@@ -266,8 +319,13 @@ class TranscriptionSettingsManager:
         model_source: str = "auto_download",
         model_path: str | None = None,
         initial_enable_bilibili_subtitle_fetch: bool = True,
-        initial_enable_asr_transcription: bool = False,
         initial_bilibili_sessdata: str = "",
+        initial_tingwu_enabled: bool = False,
+        initial_tingwu_config_path: str = "tingwu/config.json",
+        initial_tingwu_poll_interval_sec: float = 10.0,
+        initial_tingwu_timeout_sec: float = 14400.0,
+        initial_tingwu_fallback_to_whisper: bool = False,
+        temp_dir: str = "temp",
     ):
         self._lock = Lock()
         self._device = initial_device
@@ -278,8 +336,13 @@ class TranscriptionSettingsManager:
             # 兼容旧配置：曾填写过 model_path 时默认沿用手动模式。
             self._model_source = "manual_path"
         self._enable_bilibili_subtitle_fetch = initial_enable_bilibili_subtitle_fetch
-        self._enable_asr_transcription = bool(initial_enable_asr_transcription)
         self._bilibili_sessdata = _sanitize_cookie_value(initial_bilibili_sessdata)
+        self._tingwu_enabled = bool(initial_tingwu_enabled)
+        self._tingwu_config_path = _sanitize_model_path(initial_tingwu_config_path)
+        self._tingwu_poll_interval_sec = max(1.0, float(initial_tingwu_poll_interval_sec))
+        self._tingwu_timeout_sec = max(60.0, float(initial_tingwu_timeout_sec))
+        self._tingwu_fallback_to_whisper = bool(initial_tingwu_fallback_to_whisper)
+        self._temp_dir = os.path.abspath(os.path.expanduser(os.path.expandvars(str(temp_dir or "temp"))))
         self._transcriber_worker: Any = None
 
     def bind_transcriber_worker(self, worker: Any) -> None:
@@ -306,10 +369,14 @@ class TranscriptionSettingsManager:
         with self._lock:
             current_device = self._device
             enable_bilibili_subtitle_fetch = self._enable_bilibili_subtitle_fetch
-            enable_asr_transcription = self._enable_asr_transcription
             model_source = self._model_source
             model_size = self._model_size
             model_path = self._model_path
+            tingwu_enabled = self._tingwu_enabled
+            tingwu_config_path = self._tingwu_config_path
+            tingwu_poll_interval_sec = self._tingwu_poll_interval_sec
+            tingwu_timeout_sec = self._tingwu_timeout_sec
+            tingwu_fallback_to_whisper = self._tingwu_fallback_to_whisper
 
         sessdata, source = self.resolve_bilibili_sessdata()
         cuda_diag = _detect_cuda_support()
@@ -324,8 +391,25 @@ class TranscriptionSettingsManager:
             if model_source == "manual_path"
             else "自动下载模式：首次使用会自动下载/加载所选模型。"
         )
+        tingwu_config_resolved = os.path.abspath(
+            os.path.expanduser(os.path.expandvars(tingwu_config_path))
+        ) if tingwu_config_path else ""
+        tingwu_configured = False
+        if tingwu_config_resolved and os.path.isfile(tingwu_config_resolved):
+            try:
+                tingwu_configured = (os.stat(tingwu_config_resolved).st_mode & 0o077) == 0
+            except OSError:
+                tingwu_configured = False
 
         return {
+            "transcription_provider": "tingwu" if tingwu_enabled else "fast_whisper",
+            "tingwu_enabled": tingwu_enabled,
+            "tingwu_config_path": tingwu_config_path,
+            "tingwu_config_resolved": tingwu_config_resolved,
+            "tingwu_configured": tingwu_configured,
+            "tingwu_poll_interval_sec": tingwu_poll_interval_sec,
+            "tingwu_timeout_sec": tingwu_timeout_sec,
+            "tingwu_fallback_to_whisper": tingwu_fallback_to_whisper,
             "device": current_device,
             "model_source": model_source,
             "model_size": model_size,
@@ -344,7 +428,6 @@ class TranscriptionSettingsManager:
             "cuda_reason": str(cuda_diag["cuda_reason"]),
             "cuda_message": str(cuda_diag["cuda_message"]),
             "enable_bilibili_subtitle_fetch": enable_bilibili_subtitle_fetch,
-            "enable_asr_transcription": enable_asr_transcription,
             "has_bilibili_sessdata": bool(sessdata),
             "bilibili_cookie_source": source,
             "bilibili_sessdata_masked": _mask_cookie_value(sessdata),
@@ -376,6 +459,54 @@ class TranscriptionSettingsManager:
                 model_path=self._model_path,
             )
 
+    def _build_active_transcriber(
+        self,
+        *,
+        device: str,
+        model_source: str,
+        model_size: str,
+        model_path: str,
+        tingwu_enabled: bool,
+        tingwu_config_path: str,
+        tingwu_poll_interval_sec: float,
+        tingwu_timeout_sec: float,
+        tingwu_fallback_to_whisper: bool,
+    ):
+        whisper_kwargs: dict[str, str] = {}
+        if not tingwu_enabled or tingwu_fallback_to_whisper:
+            whisper_kwargs = self._build_transcriber_kwargs(
+                device=device,
+                model_source=model_source,
+                model_size=model_size,
+                model_path=model_path,
+            )
+
+        if tingwu_enabled:
+            return get_transcriber(
+                "tingwu",
+                config_path=tingwu_config_path,
+                task_root=os.path.join(self._temp_dir, "tingwu"),
+                poll_interval_sec=tingwu_poll_interval_sec,
+                timeout_sec=tingwu_timeout_sec,
+                fallback_to_whisper=tingwu_fallback_to_whisper,
+                whisper_kwargs=whisper_kwargs,
+            )
+        return get_transcriber("fast_whisper", **whisper_kwargs)
+
+    def build_active_transcriber(self):
+        with self._lock:
+            return self._build_active_transcriber(
+                device=self._device,
+                model_source=self._model_source,
+                model_size=self._model_size,
+                model_path=self._model_path,
+                tingwu_enabled=self._tingwu_enabled,
+                tingwu_config_path=self._tingwu_config_path,
+                tingwu_poll_interval_sec=self._tingwu_poll_interval_sec,
+                tingwu_timeout_sec=self._tingwu_timeout_sec,
+                tingwu_fallback_to_whisper=self._tingwu_fallback_to_whisper,
+            )
+
     def update_settings(
         self,
         device: str | None = None,
@@ -383,9 +514,13 @@ class TranscriptionSettingsManager:
         model_size: Literal["tiny", "base", "small", "medium", "large"] | str | None = None,
         model_path: str | None = None,
         enable_bilibili_subtitle_fetch: bool | None = None,
-        enable_asr_transcription: bool | None = None,
         bilibili_sessdata: str | None = None,
         clear_bilibili_sessdata: bool | None = None,
+        tingwu_enabled: bool | None = None,
+        tingwu_config_path: str | None = None,
+        tingwu_poll_interval_sec: float | None = None,
+        tingwu_timeout_sec: float | None = None,
+        tingwu_fallback_to_whisper: bool | None = None,
     ) -> dict[str, Any]:
         if (
             device is None
@@ -393,9 +528,13 @@ class TranscriptionSettingsManager:
             and model_size is None
             and model_path is None
             and enable_bilibili_subtitle_fetch is None
-            and enable_asr_transcription is None
             and bilibili_sessdata is None
             and clear_bilibili_sessdata is None
+            and tingwu_enabled is None
+            and tingwu_config_path is None
+            and tingwu_poll_interval_sec is None
+            and tingwu_timeout_sec is None
+            and tingwu_fallback_to_whisper is None
         ):
             raise ValueError("至少需要更新一个配置项")
 
@@ -404,6 +543,11 @@ class TranscriptionSettingsManager:
             current_model_source = self._model_source
             current_model_size = self._model_size
             current_model_path = self._model_path
+            current_tingwu_enabled = self._tingwu_enabled
+            current_tingwu_config_path = self._tingwu_config_path
+            current_tingwu_poll_interval_sec = self._tingwu_poll_interval_sec
+            current_tingwu_timeout_sec = self._tingwu_timeout_sec
+            current_tingwu_fallback_to_whisper = self._tingwu_fallback_to_whisper
             worker_for_rebuild = self._transcriber_worker
 
         next_device = current_device
@@ -430,12 +574,31 @@ class TranscriptionSettingsManager:
         if model_path is not None:
             next_model_path = _sanitize_model_path(model_path)
 
-        if next_device == "cuda":
+        next_tingwu_enabled = current_tingwu_enabled if tingwu_enabled is None else bool(tingwu_enabled)
+        next_tingwu_config_path = current_tingwu_config_path
+        if tingwu_config_path is not None:
+            next_tingwu_config_path = _sanitize_model_path(tingwu_config_path)
+            if not next_tingwu_config_path:
+                raise ValueError("听悟认证配置路径不能为空")
+        next_tingwu_poll_interval_sec = current_tingwu_poll_interval_sec
+        if tingwu_poll_interval_sec is not None:
+            next_tingwu_poll_interval_sec = max(1.0, float(tingwu_poll_interval_sec))
+        next_tingwu_timeout_sec = current_tingwu_timeout_sec
+        if tingwu_timeout_sec is not None:
+            next_tingwu_timeout_sec = max(60.0, float(tingwu_timeout_sec))
+        next_tingwu_fallback_to_whisper = (
+            current_tingwu_fallback_to_whisper
+            if tingwu_fallback_to_whisper is None
+            else bool(tingwu_fallback_to_whisper)
+        )
+
+        local_model_required = not next_tingwu_enabled or next_tingwu_fallback_to_whisper
+        if local_model_required and next_device == "cuda":
             cuda_diag = _detect_cuda_support()
             if not bool(cuda_diag["cuda_available"]):
                 raise ValueError(str(cuda_diag["cuda_message"]))
 
-        if next_model_source == "manual_path":
+        if local_model_required and next_model_source == "manual_path":
             valid, message, _ = _validate_manual_model_dir(next_model_path)
             if not valid:
                 raise ValueError(message)
@@ -444,11 +607,22 @@ class TranscriptionSettingsManager:
         model_source_changed = next_model_source != current_model_source
         model_size_changed = next_model_size != current_model_size
         model_path_changed = next_model_path != current_model_path
+        tingwu_enabled_changed = next_tingwu_enabled != current_tingwu_enabled
+        tingwu_config_path_changed = next_tingwu_config_path != current_tingwu_config_path
+        tingwu_poll_interval_changed = next_tingwu_poll_interval_sec != current_tingwu_poll_interval_sec
+        tingwu_timeout_changed = next_tingwu_timeout_sec != current_tingwu_timeout_sec
+        tingwu_fallback_changed = next_tingwu_fallback_to_whisper != current_tingwu_fallback_to_whisper
+        local_settings_changed = device_changed or model_source_changed or model_size_changed or model_path_changed
+        local_settings_affect_active = local_settings_changed and (
+            not next_tingwu_enabled or next_tingwu_fallback_to_whisper
+        )
         should_rebuild = bool(worker_for_rebuild) and (
-            device_changed
-            or model_source_changed
-            or model_size_changed
-            or model_path_changed
+            tingwu_enabled_changed
+            or tingwu_config_path_changed
+            or tingwu_poll_interval_changed
+            or tingwu_timeout_changed
+            or tingwu_fallback_changed
+            or local_settings_affect_active
         )
 
         transcriber = None
@@ -457,13 +631,17 @@ class TranscriptionSettingsManager:
                 logger.info(
                     "[TranscriptionSettingsManager] 正在重建转录器实例，若模型未缓存可能会触发下载，请稍候..."
                 )
-                transcriber_kwargs = self._build_transcriber_kwargs(
+                transcriber = self._build_active_transcriber(
                     device=next_device,
                     model_source=next_model_source,
                     model_size=next_model_size,
                     model_path=next_model_path,
+                    tingwu_enabled=next_tingwu_enabled,
+                    tingwu_config_path=next_tingwu_config_path,
+                    tingwu_poll_interval_sec=next_tingwu_poll_interval_sec,
+                    tingwu_timeout_sec=next_tingwu_timeout_sec,
+                    tingwu_fallback_to_whisper=next_tingwu_fallback_to_whisper,
                 )
-                transcriber = get_transcriber("fast_whisper", **transcriber_kwargs)
                 logger.info("[TranscriptionSettingsManager] 转录器实例重建完成。")
             except Exception as e:
                 raise ValueError(f"切换转录配置失败: {e}") from e
@@ -473,6 +651,11 @@ class TranscriptionSettingsManager:
             self._model_source = next_model_source
             self._model_size = next_model_size
             self._model_path = next_model_path
+            self._tingwu_enabled = next_tingwu_enabled
+            self._tingwu_config_path = next_tingwu_config_path
+            self._tingwu_poll_interval_sec = next_tingwu_poll_interval_sec
+            self._tingwu_timeout_sec = next_tingwu_timeout_sec
+            self._tingwu_fallback_to_whisper = next_tingwu_fallback_to_whisper
 
             if transcriber is not None and self._transcriber_worker is not None:
                 self._transcriber_worker.update_transcriber(transcriber)
@@ -481,7 +664,14 @@ class TranscriptionSettingsManager:
                     f"device={self._device}, model_source={self._model_source}, model_size={self._model_size}"
                 )
             elif (
-                (device_changed or model_source_changed or model_size_changed or model_path_changed)
+                (
+                    local_settings_changed
+                    or tingwu_enabled_changed
+                    or tingwu_config_path_changed
+                    or tingwu_poll_interval_changed
+                    or tingwu_timeout_changed
+                    or tingwu_fallback_changed
+                )
                 and self._transcriber_worker is None
             ):
                 logger.info(
@@ -494,12 +684,6 @@ class TranscriptionSettingsManager:
                 logger.info(
                     "[TranscriptionSettingsManager] 已更新字幕直取开关: "
                     f"enable_bilibili_subtitle_fetch={self._enable_bilibili_subtitle_fetch}"
-                )
-            if enable_asr_transcription is not None:
-                self._enable_asr_transcription = bool(enable_asr_transcription)
-                logger.info(
-                    "[TranscriptionSettingsManager] 已更新 ASR 开关: "
-                    f"enable_asr_transcription={self._enable_asr_transcription}"
                 )
 
             if clear_bilibili_sessdata:
@@ -526,7 +710,11 @@ class TranscriptionSettingsManager:
         if not sessdata:
             return {
                 "success": False,
-                "error": "未在任何浏览器中找到 B 站登录态。请确保已在浏览器中登录 bilibili.com，或关闭浏览器后重试。",
+                "error": (
+                    "未在任何浏览器中找到 B 站登录态。请确保已在浏览器中登录 bilibili.com。"
+                    "如果已登录但仍失败，通常是 Windows 上运行中的 Chromium/Edge 独占锁定了 Cookies 数据库；"
+                    "可改用未运行的浏览器资料、以远程调试方式启动浏览器，或关闭对应浏览器后重试。"
+                ),
             }
 
         with self._lock:
@@ -549,7 +737,12 @@ class TranscriptionSettingsManager:
                 "model_source": self._model_source,
                 "model_size": self._model_size,
                 "model_path": self._model_path,
+                "tingwu_enabled": self._tingwu_enabled,
+                "tingwu_config_path": self._tingwu_config_path,
+                "tingwu_poll_interval_sec": self._tingwu_poll_interval_sec,
+                "tingwu_timeout_sec": self._tingwu_timeout_sec,
+                "tingwu_fallback_to_whisper": self._tingwu_fallback_to_whisper,
                 "enable_bilibili_subtitle_fetch": self._enable_bilibili_subtitle_fetch,
-                "enable_asr_transcription": self._enable_asr_transcription,
                 "bilibili_sessdata": self._bilibili_sessdata,
             }
+

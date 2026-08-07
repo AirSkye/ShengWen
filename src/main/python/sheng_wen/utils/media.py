@@ -4,7 +4,7 @@ VIDEO_MEDIA_EXTENSIONS = {
     ".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm", ".m4v"
 }
 AUDIO_MEDIA_EXTENSIONS = {
-    ".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".wma", ".opus"
+    ".mp3", ".wav", ".flac", ".aac", ".ogg", ".m4a", ".m4s", ".wma", ".opus"
 }
 SUPPORTED_MEDIA_EXTENSIONS = VIDEO_MEDIA_EXTENSIONS | AUDIO_MEDIA_EXTENSIONS
 
@@ -22,6 +22,7 @@ def build_transcriber_payload(
     media_path: str,
     output_dir: str = "temp",
     summary_mode: str | None = None,
+    summary_style: str | None = None,
 ) -> dict:
     file_ext = get_media_extension(media_path)
     if file_ext not in SUPPORTED_MEDIA_EXTENSIONS:
@@ -35,6 +36,8 @@ def build_transcriber_payload(
     }
     if summary_mode:
         payload["summary_mode"] = str(summary_mode)
+    if summary_style:
+        payload["summary_style"] = str(summary_style)
 
     # 音频文件可直接转录；视频文件需先提取音频。
     if is_audio_media(media_path):

@@ -3,6 +3,7 @@ import { computed, watch, ref } from 'vue'
 import { PhMonitorPlay, PhList } from '@phosphor-icons/vue'
 import { marked } from 'marked'
 import { useTaskViewModel } from './composables/useTaskViewModel'
+import { useFolderViewModel } from './composables/useFolderViewModel'
 import { useMermaidViewer } from './composables/useMermaidViewer'
 import {
   useSummaryImageExporter,
@@ -15,7 +16,7 @@ import {
   type SummaryImageRenderProgress,
 } from './composables/useSummaryImageExporter'
 import { useToast } from './composables/useToast'
-import { stripDoubleBracePlaceholders } from './utils/formatters'
+import { stripDoubleBracePlaceholders, stripSummaryPresentationMarkers } from './utils/formatters'
 import { postProcessCompiledMarkdown } from './utils/markdownPostProcessor'
 import type { Task, MarkdownHeadingItem, BilibiliVideoInfo, BilibiliPartsConfig, LocalFolderScanResult } from './types'
 import Sidebar from './components/Sidebar.vue'
@@ -33,23 +34,30 @@ const {
   tasks,
   selectedTask,
   videoUrl,
-  taskTitle,
+  rawTranscriptText,
   selectedFile,
-  selectedSubtitleFile,
-  subtitleText,
-  inputSourceMode,
   localFilePath,
   isLocalClient,
   quality,
   summaryMode,
   isSubmitting,
+  uploadProgress,
+  uploadLoadedBytes,
+  uploadTotalBytes,
   error,
   activeTab,
   llmProviders,
   llmSettings,
   isUpdatingLlmSettings,
+  activeProfileId,
+  editingProfileId,
+  profileFormState,
+  isSwitchingProfile,
   transcriptionSettings,
   isUpdatingTranscriptionSettings,
+  isCheckingTingwuAuth,
+  isUpdatingTingwuSession,
+  tingwuAuthCheckResult,
   summarizationSettings,
   isUpdatingSummarizationSettings,
   isReadingBilibiliCookieFromBrowser,
@@ -63,8 +71,14 @@ const {
   reSummarize,
   reTranscribe,
   updateTaskTopic,
-  updateLlmSettings,
+  updateProfile,
+  createProfile,
+  deleteProfile,
+  switchActiveProfile,
+  editProfile,
   updateTranscriptionSettings,
+  checkTingwuAuth,
+  updateTingwuSession,
   updateSummarizationSettings,
   testLlm,
   readBilibiliCookieFromBrowser,
@@ -75,6 +89,16 @@ const {
   scanLocalFolder,
   submitLocalPathTasks,
 } = useTaskViewModel()
+
+const {
+  folders,
+  folderTree,
+  createFolder,
+  renameFolder,
+  deleteFolder,
+  moveFolder,
+  assignTaskToFolder,
+} = useFolderViewModel()
 
 // 状态变量
 const showInfoModal = ref(false)
@@ -128,6 +152,17 @@ const {
 const { exportSummaryAsImage, generateSummaryImagePreview } = useSummaryImageExporter()
 
 const SUMMARY_IMAGE_SETTINGS_STORAGE_KEY = 'ShengWen:summary-image-export-settings'
+const SUMMARY_BEAUTIFY_STORAGE_KEY = 'ShengWen:summary-beautify-enabled'
+
+const loadSummaryBeautifyPreference = () => {
+  try {
+    return localStorage.getItem(SUMMARY_BEAUTIFY_STORAGE_KEY) === 'true'
+  } catch {
+    return false
+  }
+}
+
+const beautifySummary = ref(loadSummaryBeautifyPreference())
 
 const summaryLayoutOptions: Array<{ label: string; value: SummaryImageLayoutPreset }> = [
   { label: '9:16 手机竖版', value: 'mobile-9-16' },
@@ -189,6 +224,7 @@ const getSummaryImageExportPayload = () => {
     topic: topic.value || selectedTask.value.title || 'AI 总结',
     compiledMarkdown: compiledMarkdown.value,
     rawSummary: selectedTask.value.summary,
+    beautifySummary: beautifySummary.value,
   }
 }
 
@@ -328,13 +364,13 @@ const handleCopyTranscript = async () => {
 const handleReSummarize = (taskId: string) => {
   const { info } = useToast()
   info('正在重新生成 AI 总结...')
-  reSummarize(taskId)
+  reSummarize(taskId, beautifySummary.value ? 'report' : 'classic')
 }
 
 const handleReTranscribe = (taskId: string) => {
   const { info } = useToast()
   info('正在重新转录原文...')
-  reTranscribe(taskId)
+  reTranscribe(taskId, beautifySummary.value ? 'report' : 'classic')
 }
 
 const handleDownloadMarkdown = () => {
@@ -397,52 +433,99 @@ const handleExportSummaryImage = async () => {
 }
 
 const handleUpdateLlmSettings = async (payload: {
-  provider: string
+  profile_id: string
+  name?: string
+  provider?: string
   base_url?: string
   api_key?: string
   model_id?: string
   temperature?: number
 }) => {
   try {
-    await updateLlmSettings(payload)
+    await updateProfile(payload)
     success('LLM 配置已更新')
-  } catch (_e) {
-    // 错误信息由 useTaskViewModel + Toast 统一处理
-  }
+  } catch (_e) {}
 }
 
 const handleUpdateLlmSettingsAndTest = async (payload: {
-  provider: string
+  profile_id: string
+  name?: string
+  provider?: string
   base_url?: string
   api_key?: string
   model_id?: string
   temperature?: number
 }) => {
   try {
-    // 先保存配置
-    await updateLlmSettings(payload)
+    await updateProfile(payload)
     success('LLM 配置已更新')
-
-    // 配置保存成功后立即测试
     await handleTestLlm()
-  } catch (_e) {
-    // 错误信息由 useTaskViewModel + Toast 统一处理
-  }
+  } catch (_e) {}
+}
+
+const handleCreateProfile = async (name: string, provider: string) => {
+  try {
+    await createProfile(name, provider)
+    success('配置已创建')
+  } catch (_e) {}
+}
+
+const handleDeleteProfile = async (profileId: string) => {
+  try {
+    await deleteProfile(profileId)
+    success('配置已删除')
+  } catch (_e) {}
+}
+
+const handleSwitchActiveProfile = async (profileId: string) => {
+  try {
+    await switchActiveProfile(profileId)
+  } catch (_e) {}
+}
+
+const handleEditProfile = (profileId: string) => {
+  editProfile(profileId)
 }
 
 const handleUpdateTranscriptionSettings = async (payload: {
+  tingwu_enabled?: boolean
+  tingwu_config_path?: string
+  tingwu_poll_interval_sec?: number
+  tingwu_timeout_sec?: number
+  tingwu_fallback_to_whisper?: boolean
   device?: 'cpu' | 'cuda'
   model_source?: 'auto_download' | 'manual_path'
   model_size?: 'tiny' | 'base' | 'small' | 'medium' | 'large'
   model_path?: string
   enable_bilibili_subtitle_fetch?: boolean
-  enable_asr_transcription?: boolean
   bilibili_sessdata?: string
   clear_bilibili_sessdata?: boolean
 }) => {
   try {
     await updateTranscriptionSettings(payload)
     success('转录配置已更新')
+  } catch (_e) {
+    // 错误信息由 useTaskViewModel + Toast 统一处理
+  }
+}
+
+const handleCheckTingwuAuth = async () => {
+  try {
+    const result = await checkTingwuAuth()
+    if (result.valid) {
+      success(result.message)
+    }
+  } catch (_e) {
+    // 错误信息由 useTaskViewModel + Toast 统一处理
+  }
+}
+
+const handleUpdateTingwuSession = async (session: string) => {
+  try {
+    const result = await updateTingwuSession(session)
+    if (result.valid) {
+      success(result.message)
+    }
   } catch (_e) {
     // 错误信息由 useTaskViewModel + Toast 统一处理
   }
@@ -463,9 +546,9 @@ const handleReadBilibiliCookieFromBrowser = async () => {
 
 // B站分P处理
 const handleSubmit = async () => {
-  // 字幕上传/粘贴模式：直接按字幕任务提交流程走，不做链接校验
-  if (inputSourceMode.value === 'subtitle') {
-    await submitTask()
+  const summaryStyle = beautifySummary.value ? 'report' : 'classic'
+  if (rawTranscriptText.value.trim()) {
+    await submitTask(summaryStyle)
     return
   }
 
@@ -508,13 +591,13 @@ const handleSubmit = async () => {
     }
 
     // 是文件，直接提交
-    await submitTask()
+    await submitTask(summaryStyle)
     return
   }
 
   // 文件上传
   if (selectedFile.value) {
-    await submitTask()
+    await submitTask(summaryStyle)
     return
   }
 
@@ -538,25 +621,30 @@ const handleSubmit = async () => {
         isSubmitting.value = false
       } else {
         // 单P视频，直接提交
-        await submitTask()
+        await submitTask(summaryStyle)
       }
     } catch (err) {
       // 检查失败，直接提交（后端会处理）
       console.error('Failed to check Bilibili video info:', err)
-      await submitTask()
+      await submitTask(summaryStyle)
     } finally {
       isCheckingBilibiliVideoInfo.value = false
     }
   } else {
     // 非B站视频，直接提交
-    await submitTask()
+    await submitTask(summaryStyle)
   }
 }
 
 const handleBilibiliPartsConfirm = async (config: BilibiliPartsConfig) => {
   isBilibiliPartsSelectorOpen.value = false
   try {
-    await submitTaskWithParts(pendingBilibiliUrl.value, config)
+    await submitTaskWithParts(
+      pendingBilibiliUrl.value,
+      config,
+      undefined,
+      beautifySummary.value ? 'report' : 'classic',
+    )
     videoUrl.value = ''
     success('已提交任务')
   } catch (_e) {
@@ -573,7 +661,11 @@ const handleBilibiliPartsClose = () => {
 const handleLocalFolderConfirm = async (config: { mode: 'merge' | 'separate'; paths: string[] }) => {
   isLocalFolderSelectorOpen.value = false
   try {
-    await submitLocalPathTasks(config.paths, config.mode)
+    await submitLocalPathTasks(
+      config.paths,
+      config.mode,
+      beautifySummary.value ? 'report' : 'classic',
+    )
     localFilePath.value = ''
     if (config.paths.length > 1) {
       success(`已提交 ${config.paths.length} 个任务`)
@@ -610,12 +702,13 @@ const cancelEditingTopic = () => {
   isEditingTopic.value = false
 }
 
-const handleSelectTask = (task: Task) => {
+const handleSelectTask = async (task: Task) => {
   summaryHighlightRequest.value = null
   markdownHeadings.value = []
   activeHeadingId.value = ''
   headingJumpRequest.value = null
-  selectTask(task)
+  await selectTask(task)
+  beautifySummary.value = selectedTask.value?.summary_style === 'report'
 }
 
 const handleFocusSearchMatch = (payload: {
@@ -643,6 +736,8 @@ const handleUpdateSummarizationSettings = async (payload: {
   boundary_jump_sec?: number
   auto_chunk_min_audio_duration_sec?: number
   auto_chunk_min_transcript_lines?: number
+  auto_chunk_min_plain_text_chars?: number
+  summary_detail_level?: number
   max_agent_value_chars?: number
   fallback_to_standard_on_agent_error?: boolean
 }) => {
@@ -669,6 +764,12 @@ watch(error, (newError) => {
   }
 })
 
+watch(tingwuAuthCheckResult, (result, previousResult) => {
+  if (result && !result.valid && result.message !== previousResult?.message) {
+    toastError(`${result.message} 请在“转录设置”中更新 Session。`)
+  }
+})
+
 watch(summaryImageSettings, (nextSettings) => {
   try {
     localStorage.setItem(SUMMARY_IMAGE_SETTINGS_STORAGE_KEY, JSON.stringify(nextSettings))
@@ -679,6 +780,17 @@ watch(summaryImageSettings, (nextSettings) => {
     summaryPreviewDirty.value = true
   }
 }, { deep: true })
+
+watch(beautifySummary, (enabled) => {
+  try {
+    localStorage.setItem(SUMMARY_BEAUTIFY_STORAGE_KEY, String(enabled))
+  } catch {
+    // Ignore persistence failure.
+  }
+  if (isSummaryImageSettingsOpen.value) {
+    summaryPreviewDirty.value = true
+  }
+})
 
 // 配置 marked 渲染器以支持 mermaid 类名
 const renderer = new marked.Renderer()
@@ -692,10 +804,14 @@ marked.setOptions({ renderer })
 
 const compiledMarkdown = computed(() => {
   if (!selectedTask.value?.summary) return ''
-  const cleanedSummary = stripDoubleBracePlaceholders(selectedTask.value.summary)
+  const sourceSummary = beautifySummary.value
+    ? selectedTask.value.summary
+    : stripSummaryPresentationMarkers(selectedTask.value.summary)
+  const cleanedSummary = stripDoubleBracePlaceholders(sourceSummary)
   const html = marked.parse(cleanedSummary) as string
   return postProcessCompiledMarkdown(html, {
     videoUrl: selectedTask.value.video_url || '',
+    enhancePresentation: beautifySummary.value,
   })
 })
 
@@ -745,18 +861,31 @@ watch(
       :isOpen="isSettingsModalOpen"
       :llmProviders="llmProviders"
       :llmSettings="llmSettings"
+      :activeProfileId="activeProfileId"
+      :editingProfileId="editingProfileId"
+      :profileFormState="profileFormState"
       :isUpdatingLlmSettings="isUpdatingLlmSettings"
       :isTestingLlm="isTestingLlm"
+      :isSwitchingProfile="isSwitchingProfile"
       :transcriptionSettings="transcriptionSettings"
       :isUpdatingTranscriptionSettings="isUpdatingTranscriptionSettings"
+      :isCheckingTingwuAuth="isCheckingTingwuAuth"
+      :isUpdatingTingwuSession="isUpdatingTingwuSession"
+      :tingwuAuthCheckResult="tingwuAuthCheckResult"
       :summarizationSettings="summarizationSettings"
       :isUpdatingSummarizationSettings="isUpdatingSummarizationSettings"
       :isReadingBilibiliCookieFromBrowser="isReadingBilibiliCookieFromBrowser"
       @close="isSettingsModalOpen = false"
+      @switchActiveProfile="handleSwitchActiveProfile"
+      @editProfile="handleEditProfile"
+      @createProfile="handleCreateProfile"
+      @deleteProfile="handleDeleteProfile"
       @updateLlmSettings="handleUpdateLlmSettings"
       @updateLlmSettingsAndTest="handleUpdateLlmSettingsAndTest"
       @testLlm="handleTestLlm"
       @updateTranscriptionSettings="handleUpdateTranscriptionSettings"
+      @checkTingwuAuth="handleCheckTingwuAuth"
+      @updateTingwuSession="handleUpdateTingwuSession"
       @readBilibiliCookieFromBrowser="handleReadBilibiliCookieFromBrowser"
       @updateSummarizationSettings="handleUpdateSummarizationSettings"
     />
@@ -769,38 +898,54 @@ watch(
     <!-- 左侧边栏 -->
     <Sidebar
       v-model:videoUrl="videoUrl"
-      v-model:taskTitle="taskTitle"
+      v-model:rawTranscriptText="rawTranscriptText"
       v-model:selectedFile="selectedFile"
-      v-model:selectedSubtitleFile="selectedSubtitleFile"
-      v-model:subtitleText="subtitleText"
-      v-model:inputSourceMode="inputSourceMode"
       v-model:localFilePath="localFilePath"
       v-model:quality="quality"
       v-model:summaryMode="summaryMode"
+      v-model:beautifySummary="beautifySummary"
       v-model:isSidebarOpen="isSidebarOpen"
       :isLocalClient="isLocalClient"
       :tasks="tasks"
       :selectedTask="selectedTask"
       :isSubmitting="isSubmitting"
+      :uploadProgress="uploadProgress"
+      :uploadLoadedBytes="uploadLoadedBytes"
+      :uploadTotalBytes="uploadTotalBytes"
       :llmProviders="llmProviders"
       :llmSettings="llmSettings"
+      :activeProfileId="activeProfileId"
+      :editingProfileId="editingProfileId"
+      :profileFormState="profileFormState"
       :isUpdatingLlmSettings="isUpdatingLlmSettings"
       :isTestingLlm="isTestingLlm"
+      :isSwitchingProfile="isSwitchingProfile"
       :transcriptionSettings="transcriptionSettings"
       :isUpdatingTranscriptionSettings="isUpdatingTranscriptionSettings"
       :summarizationSettings="summarizationSettings"
       :isUpdatingSummarizationSettings="isUpdatingSummarizationSettings"
+      :folders="folders"
+      :folderTree="folderTree"
       @submit="handleSubmit"
       @cancelSubmit="cancelSubmitting"
       @selectTask="handleSelectTask"
       @deleteTask="handleDeleteTask"
       @updateLlmSettings="handleUpdateLlmSettings"
+      @switchActiveProfile="handleSwitchActiveProfile"
+      @editProfile="handleEditProfile"
+      @createProfile="handleCreateProfile"
+      @deleteProfile="handleDeleteProfile"
       @updateTranscriptionSettings="handleUpdateTranscriptionSettings"
       @updateSummarizationSettings="handleUpdateSummarizationSettings"
       @startTestLlm="handleTestLlm"
       @focusSearchMatch="handleFocusSearchMatch"
       @showInfo="(task) => { handleSelectTask(task); showInfoModal = true; }"
       @openSettings="isSettingsModalOpen = true"
+      @createFolder="(name: string, parentId: string | null) => createFolder(name, parentId)"
+      @renameFolder="(folderId: string, newName: string) => renameFolder(folderId, newName)"
+      @deleteFolder="deleteFolder"
+      @assignTaskToFolder="(taskId: string, folderId: string | null) => assignTaskToFolder(taskId, folderId)"
+      @moveFolder="(folderId: string, newParentId: string | null) => moveFolder(folderId, newParentId)"
     />
 
     <!-- 右侧内容区 -->
@@ -809,6 +954,7 @@ watch(
         <!-- 悬浮气泡工具栏 -->
         <FloatingToolbar
           v-model:activeTab="activeTab"
+          v-model:beautifySummary="beautifySummary"
           :selectedTask="selectedTask"
           :isSidebarOpen="isSidebarOpen"
           :headings="markdownHeadings"
@@ -830,6 +976,7 @@ watch(
           :task="selectedTask"
           :active-tab="activeTab"
           :compiled-markdown="compiledMarkdown"
+          :beautify-summary="beautifySummary"
           :summary-highlight-request="summaryHighlightRequest"
           :heading-jump-request="headingJumpRequest"
           :topic="topic"
@@ -933,3 +1080,4 @@ watch(
 /* 移动端点击高亮优化 */
 html, body { -webkit-tap-highlight-color: transparent; }
 </style>
+

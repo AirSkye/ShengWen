@@ -3,12 +3,17 @@ import axios from 'axios'
 import type {
   Task,
   CreateTaskRequest,
+  RawTextTaskRequest,
   SummaryMode,
+  SummaryStyle,
   LLMProvider,
   LLMSettings,
-  UpdateLLMSettingsRequest,
+  CreateProfileRequest,
+  UpdateProfileRequest,
+  SwitchActiveProfileRequest,
   TranscriptionSettings,
   UpdateTranscriptionSettingsRequest,
+  TingwuAuthCheckResult,
   SummarizationSettings,
   UpdateSummarizationSettingsRequest,
   BilibiliCookieFromBrowserResult,
@@ -136,23 +141,30 @@ export function useTaskViewModel() {
   const tasks = ref<Task[]>([])
   const selectedTask = ref<Task | null>(null)
   const videoUrl = ref('')
-  const taskTitle = ref('')
+  const rawTranscriptText = ref('')
   const selectedFile = ref<File | null>(null)
-  const selectedSubtitleFile = ref<File | null>(null)
-  const subtitleText = ref('')
-  const inputSourceMode = ref<'bilibili' | 'subtitle'>('bilibili')
   const localFilePath = ref('')
   const quality = ref('audio_only')
   const summaryMode = ref<Exclude<SummaryMode, 'auto'>>('standard')
   const isSubmitting = ref(false)
+  const uploadProgress = ref<number | null>(null)
+  const uploadLoadedBytes = ref(0)
+  const uploadTotalBytes = ref(0)
   const error = ref<string | null>(null)
   const activeTab = ref<'summary' | 'transcript'>('summary')
   const isSidebarOpen = ref(false)
   const llmProviders = ref<LLMProvider[]>([])
   const llmSettings = ref<LLMSettings | null>(null)
   const isUpdatingLlmSettings = ref(false)
+  const activeProfileId = ref('')
+  const editingProfileId = ref('')
+  const profileFormState = ref({ name: '', provider: '', base_url: '', model_id: '', temperature: 0.7, api_key: '' })
+  const isSwitchingProfile = ref(false)
   const transcriptionSettings = ref<TranscriptionSettings | null>(null)
   const isUpdatingTranscriptionSettings = ref(false)
+  const isCheckingTingwuAuth = ref(false)
+  const isUpdatingTingwuSession = ref(false)
+  const tingwuAuthCheckResult = ref<TingwuAuthCheckResult | null>(null)
   const summarizationSettings = ref<SummarizationSettings | null>(null)
   const isUpdatingSummarizationSettings = ref(false)
   const isReadingBilibiliCookieFromBrowser = ref(false)
@@ -180,21 +192,21 @@ export function useTaskViewModel() {
     }
   }
 
-  const submitTask = async () => {
-    if (inputSourceMode.value === 'subtitle') {
-      await submitSubtitleTask()
+  const submitTask = async (summaryStyle: SummaryStyle = 'classic') => {
+    if (rawTranscriptText.value.trim()) {
+      await submitRawTextTask(rawTranscriptText.value, summaryStyle)
       return
     }
 
     // localhost 场景优先使用本地路径直读（避免文件上传复制）
     if (isLocalClient && localFilePath.value.trim()) {
-      await submitLocalPathTask(localFilePath.value)
+      await submitLocalPathTask(localFilePath.value, summaryStyle)
       return
     }
 
     // 文件上传优先
     if (selectedFile.value) {
-      await uploadFile(selectedFile.value)
+      await uploadFile(selectedFile.value, summaryStyle)
       return
     }
 
@@ -214,13 +226,13 @@ export function useTaskViewModel() {
         video_url: resolvedUrl,
         quality: quality.value,
         summary_mode: summaryMode.value,
-        title: taskTitle.value.trim() || undefined,
+        summary_style: summaryStyle,
       }
       await axios.post(`${apiBaseUrl}/tasks/`, payload, {
         signal: controller.signal
       })
       videoUrl.value = ''
-      taskTitle.value = ''
+      rawTranscriptText.value = ''
       // No need to fetchTasks here, WS will notify
     } catch (err) {
       if (isCanceledRequest(err)) {
@@ -236,7 +248,47 @@ export function useTaskViewModel() {
     }
   }
 
-  const submitLocalPathTask = async (filePath: string) => {
+  const submitRawTextTask = async (text: string, summaryStyle: SummaryStyle = 'classic') => {
+    const normalized = text.trim()
+    if (!normalized) {
+      error.value = '请粘贴要总结的转录文本'
+      return
+    }
+
+    const controller = new AbortController()
+    submitAbortController = controller
+    isSubmitting.value = true
+    error.value = null
+    try {
+      const firstLine = normalized.split(/\r?\n/).find(line => line.trim())?.trim() || ''
+      const payload: RawTextTaskRequest = {
+        text: normalized,
+        title: firstLine ? firstLine.slice(0, 80) : undefined,
+        summary_mode: summaryMode.value,
+        summary_style: summaryStyle,
+      }
+      await axios.post(`${apiBaseUrl}/tasks/raw-text`, payload, {
+        signal: controller.signal
+      })
+      rawTranscriptText.value = ''
+      videoUrl.value = ''
+      localFilePath.value = ''
+      selectedFile.value = null
+    } catch (err) {
+      if (isCanceledRequest(err)) {
+        return
+      }
+      console.error('Failed to submit raw text task:', err)
+      error.value = getAxiosErrorMessage(err, '粘贴文本提交失败')
+    } finally {
+      if (submitAbortController === controller) {
+        submitAbortController = null
+        isSubmitting.value = false
+      }
+    }
+  }
+
+  const submitLocalPathTask = async (filePath: string, summaryStyle: SummaryStyle = 'classic') => {
     const normalized = filePath.trim()
     if (!normalized) {
       error.value = '请输入本地文件路径'
@@ -251,13 +303,13 @@ export function useTaskViewModel() {
       await axios.post(`${apiBaseUrl}/upload/local-path`, {
         file_path: normalized,
         summary_mode: summaryMode.value,
-        title: taskTitle.value.trim() || undefined,
+        summary_style: summaryStyle,
       }, {
         signal: controller.signal
       })
       localFilePath.value = ''
       selectedFile.value = null
-      taskTitle.value = ''
+      rawTranscriptText.value = ''
     } catch (err) {
       if (isCanceledRequest(err)) {
         return
@@ -272,29 +324,42 @@ export function useTaskViewModel() {
     }
   }
 
-  const uploadFile = async (file: File) => {
+  const uploadFile = async (file: File, summaryStyle: SummaryStyle = 'classic') => {
     const controller = new AbortController()
     submitAbortController = controller
     isSubmitting.value = true
+    uploadProgress.value = 0
+    uploadLoadedBytes.value = 0
+    uploadTotalBytes.value = file.size
     error.value = null
     try {
       const formData = new FormData()
       formData.append('file', file)
       formData.append('summary_mode', summaryMode.value)
-      if (taskTitle.value.trim()) {
-        formData.append('title', taskTitle.value.trim())
-      }
+      formData.append('summary_style', summaryStyle)
 
       await axios.post(`${apiBaseUrl}/upload`, formData, {
         headers: {
           'Content-Type': 'multipart/form-data'
         },
-        signal: controller.signal
+        signal: controller.signal,
+        onUploadProgress: (event) => {
+          const total = Number(event.total || file.size || 0)
+          const loaded = Math.max(0, Number(event.loaded || 0))
+          const ratio = total > 0
+            ? loaded / total
+            : Number(event.progress || 0)
+
+          uploadLoadedBytes.value = total > 0 ? Math.min(loaded, total) : loaded
+          uploadTotalBytes.value = total
+          uploadProgress.value = Math.round(Math.max(0, Math.min(ratio * 100, 100)))
+        },
       })
 
+      uploadProgress.value = 100
       selectedFile.value = null
       localFilePath.value = ''
-      taskTitle.value = ''
+      rawTranscriptText.value = ''
       // No need to fetchTasks here, WS will notify
     } catch (err) {
       if (isCanceledRequest(err)) {
@@ -307,52 +372,9 @@ export function useTaskViewModel() {
         submitAbortController = null
         isSubmitting.value = false
       }
-    }
-  }
-
-  const submitSubtitleTask = async () => {
-    const hasFile = !!selectedSubtitleFile.value
-    const hasText = !!subtitleText.value.trim()
-    if (!hasFile && !hasText) {
-      error.value = '请上传字幕文件，或直接粘贴字幕文本。'
-      return
-    }
-    const controller = new AbortController()
-    submitAbortController = controller
-    isSubmitting.value = true
-    error.value = null
-    try {
-      const formData = new FormData()
-      if (hasFile && selectedSubtitleFile.value) {
-        formData.append('subtitle_file', selectedSubtitleFile.value)
-      }
-      if (hasText) {
-        formData.append('subtitle_text', subtitleText.value)
-      }
-      formData.append('summary_mode', summaryMode.value)
-      formData.append('title', taskTitle.value.trim() || '字幕总结任务')
-
-      await axios.post(`${apiBaseUrl}/tasks/subtitle`, formData, {
-        headers: {
-          'Content-Type': 'multipart/form-data'
-        },
-        signal: controller.signal
-      })
-      selectedSubtitleFile.value = null
-      subtitleText.value = ''
-      taskTitle.value = ''
-      videoUrl.value = ''
-      selectedFile.value = null
-      localFilePath.value = ''
-    } catch (err) {
-      if (isCanceledRequest(err)) return
-      console.error('Failed to submit subtitle task:', err)
-      error.value = getAxiosErrorMessage(err, '提交字幕总结失败')
-    } finally {
-      if (submitAbortController === controller) {
-        submitAbortController = null
-        isSubmitting.value = false
-      }
+      uploadProgress.value = null
+      uploadLoadedBytes.value = 0
+      uploadTotalBytes.value = 0
     }
   }
 
@@ -362,6 +384,9 @@ export function useTaskViewModel() {
       submitAbortController = null
     }
     isSubmitting.value = false
+    uploadProgress.value = null
+    uploadLoadedBytes.value = 0
+    uploadTotalBytes.value = 0
   }
 
   const selectTask = async (task: Task) => {
@@ -468,24 +493,61 @@ export function useTaskViewModel() {
     try {
       const response = await axios.get(`${apiBaseUrl}/llm/settings`)
       llmSettings.value = response.data
+      syncProfileFormState(response.data)
     } catch (err) {
       console.error('Failed to fetch LLM settings:', err)
       error.value = '获取 LLM 配置失败'
     }
   }
 
-  const updateLlmSettings = async (payload: UpdateLLMSettingsRequest) => {
+  const syncProfileFormState = (settings: LLMSettings) => {
+    activeProfileId.value = settings.active_profile_id
+    if (!editingProfileId.value) {
+      editingProfileId.value = settings.active_profile_id
+    }
+    const profile = settings.profiles.find(p => p.id === editingProfileId.value)
+    if (profile) {
+      profileFormState.value = {
+        name: profile.name,
+        provider: profile.provider,
+        base_url: profile.base_url,
+        model_id: profile.model_id,
+        temperature: profile.temperature,
+        api_key: '',
+      }
+    }
+  }
+
+  const editProfile = (profileId: string) => {
+    editingProfileId.value = profileId
+    const profile = llmSettings.value?.profiles.find(p => p.id === profileId)
+    if (profile) {
+      profileFormState.value = {
+        name: profile.name,
+        provider: profile.provider,
+        base_url: profile.base_url,
+        model_id: profile.model_id,
+        temperature: profile.temperature,
+        api_key: '',
+      }
+    }
+  }
+
+  const createProfile = async (name: string, provider: string) => {
     isUpdatingLlmSettings.value = true
     try {
-      const response = await axios.put(`${apiBaseUrl}/llm/settings`, payload)
+      const payload: CreateProfileRequest = { name, provider }
+      const response = await axios.post(`${apiBaseUrl}/llm/profiles`, payload)
       llmSettings.value = response.data
+      editingProfileId.value = response.data.active_profile_id
+      syncProfileFormState(response.data)
       return response.data as LLMSettings
     } catch (err) {
-      console.error('Failed to update LLM settings:', err)
+      console.error('Failed to create profile:', err)
       if (axios.isAxiosError(err) && err.response) {
-        error.value = err.response.data?.detail || '更新 LLM 配置失败'
+        error.value = err.response.data?.detail || '创建配置失败'
       } else {
-        error.value = '更新 LLM 配置失败'
+        error.value = '创建配置失败'
       }
       throw err
     } finally {
@@ -493,10 +555,66 @@ export function useTaskViewModel() {
     }
   }
 
+  const switchActiveProfile = async (profileId: string) => {
+    isSwitchingProfile.value = true
+    try {
+      const response = await axios.put(`${apiBaseUrl}/llm/active-profile`, { profile_id: profileId } as SwitchActiveProfileRequest)
+      llmSettings.value = response.data
+      activeProfileId.value = profileId
+      editProfile(profileId)
+    } catch (err) {
+      console.error('Failed to switch profile:', err)
+      error.value = '切换配置失败'
+    } finally {
+      isSwitchingProfile.value = false
+    }
+  }
+
+  const updateProfile = async (payload: UpdateProfileRequest) => {
+    isUpdatingLlmSettings.value = true
+    try {
+      const response = await axios.put(`${apiBaseUrl}/llm/settings`, payload)
+      llmSettings.value = response.data
+      syncProfileFormState(response.data)
+      return response.data as LLMSettings
+    } catch (err) {
+      console.error('Failed to update profile:', err)
+      if (axios.isAxiosError(err) && err.response) {
+        error.value = err.response.data?.detail || '更新配置失败'
+      } else {
+        error.value = '更新配置失败'
+      }
+      throw err
+    } finally {
+      isUpdatingLlmSettings.value = false
+    }
+  }
+
+  const deleteProfile = async (profileId: string) => {
+    try {
+      const response = await axios.delete(`${apiBaseUrl}/llm/profiles/${profileId}`)
+      llmSettings.value = response.data
+      if (editingProfileId.value === profileId) {
+        editProfile(response.data.active_profile_id)
+      }
+    } catch (err) {
+      console.error('Failed to delete profile:', err)
+      if (axios.isAxiosError(err) && err.response) {
+        error.value = err.response.data?.detail || '删除配置失败'
+      } else {
+        error.value = '删除配置失败'
+      }
+      throw err
+    }
+  }
+
   const fetchTranscriptionSettings = async () => {
     try {
       const response = await axios.get(`${apiBaseUrl}/transcription/settings`)
       transcriptionSettings.value = response.data
+      if (transcriptionSettings.value?.tingwu_enabled) {
+        void checkTingwuAuth().catch(() => undefined)
+      }
     } catch (err) {
       console.error('Failed to fetch transcription settings:', err)
       error.value = '获取转录配置失败'
@@ -519,6 +637,36 @@ export function useTaskViewModel() {
       throw err
     } finally {
       isUpdatingTranscriptionSettings.value = false
+    }
+  }
+
+  const checkTingwuAuth = async () => {
+    isCheckingTingwuAuth.value = true
+    try {
+      const response = await axios.post(`${apiBaseUrl}/transcription/tingwu/check`)
+      tingwuAuthCheckResult.value = response.data as TingwuAuthCheckResult
+      return tingwuAuthCheckResult.value
+    } catch (err) {
+      console.error('Failed to check Tingwu auth:', err)
+      error.value = getAxiosErrorMessage(err, '听悟认证检查失败')
+      throw err
+    } finally {
+      isCheckingTingwuAuth.value = false
+    }
+  }
+
+  const updateTingwuSession = async (session: string) => {
+    isUpdatingTingwuSession.value = true
+    try {
+      const response = await axios.put(`${apiBaseUrl}/transcription/tingwu/session`, { session })
+      tingwuAuthCheckResult.value = response.data as TingwuAuthCheckResult
+      return tingwuAuthCheckResult.value
+    } catch (err) {
+      console.error('Failed to update Tingwu session:', err)
+      error.value = getAxiosErrorMessage(err, '听悟 Session 更新失败')
+      throw err
+    } finally {
+      isUpdatingTingwuSession.value = false
     }
   }
 
@@ -625,7 +773,8 @@ export function useTaskViewModel() {
 
   const submitLocalPathTasks = async (
     paths: string[],
-    mode: 'merge' | 'separate'
+    mode: 'merge' | 'separate',
+    summaryStyle: SummaryStyle = 'classic',
   ): Promise<void> => {
     const controller = new AbortController()
     submitAbortController = controller
@@ -643,6 +792,7 @@ export function useTaskViewModel() {
           await axios.post(`${apiBaseUrl}/upload/local-path`, {
             file_path: path,
             summary_mode: summaryMode.value,
+            summary_style: summaryStyle,
           }, {
             signal: controller.signal
           })
@@ -668,7 +818,8 @@ export function useTaskViewModel() {
   const submitTaskWithParts = async (
     videoUrl: string,
     partsConfig: BilibiliPartsConfig,
-    abortSignal?: AbortSignal
+    abortSignal?: AbortSignal,
+    summaryStyle: SummaryStyle = 'classic',
   ): Promise<void> => {
     const controller = new AbortController()
     submitAbortController = controller
@@ -680,6 +831,7 @@ export function useTaskViewModel() {
         video_url: videoUrl,
         quality: quality.value,
         summary_mode: summaryMode.value,
+        summary_style: summaryStyle,
         bilibili_parts: partsConfig,
       }
       await axios.post(`${apiBaseUrl}/tasks/`, payload, {
@@ -721,30 +873,38 @@ export function useTaskViewModel() {
     tasks,
     selectedTask,
     videoUrl,
-    taskTitle,
+    rawTranscriptText,
     selectedFile,
-    selectedSubtitleFile,
-    subtitleText,
-    inputSourceMode,
     localFilePath,
     isLocalClient,
     quality,
     summaryMode,
     isSubmitting,
+    uploadProgress,
+    uploadLoadedBytes,
+    uploadTotalBytes,
     error,
     activeTab,
     isSidebarOpen,
     llmProviders,
     llmSettings,
     isUpdatingLlmSettings,
+    activeProfileId,
+    editingProfileId,
+    profileFormState,
+    isSwitchingProfile,
     transcriptionSettings,
     isUpdatingTranscriptionSettings,
+    isCheckingTingwuAuth,
+    isUpdatingTingwuSession,
+    tingwuAuthCheckResult,
     summarizationSettings,
     isUpdatingSummarizationSettings,
     isReadingBilibiliCookieFromBrowser,
 
     // Actions
     submitTask,
+    submitRawTextTask,
     submitLocalPathTask,
     uploadFile,
     cancelSubmitting,
@@ -752,9 +912,16 @@ export function useTaskViewModel() {
     fetchTasks,
     fetchLlmProviders,
     fetchLlmSettings,
-    updateLlmSettings,
+    updateProfile,
+    createProfile,
+    deleteProfile,
+    switchActiveProfile,
+    editProfile,
+    syncProfileFormState,
     fetchTranscriptionSettings,
     updateTranscriptionSettings,
+    checkTingwuAuth,
+    updateTingwuSession,
     fetchSummarizationSettings,
     updateSummarizationSettings,
     testLlm,
@@ -816,10 +983,11 @@ export function useTaskViewModel() {
         return false
       }
     },
-    reSummarize: async (taskId: string) => {
+    reSummarize: async (taskId: string, summaryStyle: SummaryStyle = 'classic') => {
       try {
         await axios.post(`${apiBaseUrl}/tasks/${taskId}/re-summarize`, {
-          summary_mode: summaryMode.value
+          summary_mode: summaryMode.value,
+          summary_style: summaryStyle,
         })
         // No need to do more, WS will update the status
       } catch (err) {
@@ -827,10 +995,11 @@ export function useTaskViewModel() {
         error.value = '重新总结失败'
       }
     },
-    reTranscribe: async (taskId: string) => {
+    reTranscribe: async (taskId: string, summaryStyle: SummaryStyle = 'classic') => {
       try {
         await axios.post(`${apiBaseUrl}/tasks/${taskId}/re-transcribe`, {
-          summary_mode: summaryMode.value
+          summary_mode: summaryMode.value,
+          summary_style: summaryStyle,
         })
         // No need to do more, WS will update the status
       } catch (err) {

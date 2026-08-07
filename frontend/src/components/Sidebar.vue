@@ -11,10 +11,8 @@ import {
   PhX,
   PhTrash,
   PhInfo,
-  PhCpu,
   PhKey,
   PhGearSix,
-  // PhList,
   PhMagnifyingGlass,
   PhFolder,
   PhFloppyDisk,
@@ -22,6 +20,7 @@ import {
   PhPlayCircle,
   PhLightning,
   PhBrain,
+  PhSparkle,
   PhFile,
   PhQuestion,
 } from '@phosphor-icons/vue'
@@ -32,19 +31,20 @@ import {
   type LLMProvider,
   type LLMSettings,
   type TranscriptionSettings,
-  type SummarizationSettings
+  type SummarizationSettings,
+  type Folder,
+  type FolderTreeNode,
 } from '../types'
 import ThemeSelector from './ThemeSelector.vue'
+import FolderBrowser from './FolderBrowser/FolderBrowser.vue'
 
 const videoUrl = defineModel<string>('videoUrl', { required: true })
-const taskTitle = defineModel<string>('taskTitle', { default: '' })
+const rawTranscriptText = defineModel<string>('rawTranscriptText', { default: '' })
 const selectedFile = defineModel<File | null>('selectedFile', { default: null })
-const selectedSubtitleFile = defineModel<File | null>('selectedSubtitleFile', { default: null })
-const subtitleText = defineModel<string>('subtitleText', { default: '' })
-const inputSourceMode = defineModel<'bilibili' | 'subtitle'>('inputSourceMode', { default: 'bilibili' })
 const localFilePath = defineModel<string>('localFilePath', { default: '' })
 // const quality = defineModel<string>('quality', { required: true })
 const summaryMode = defineModel<Exclude<SummaryMode, 'auto'>>('summaryMode', { default: 'standard' })
+const beautifySummary = defineModel<boolean>('beautifySummary', { default: false })
 const isSidebarOpen = defineModel<boolean>('isSidebarOpen', { required: true })
 
 const props = defineProps<{
@@ -52,14 +52,23 @@ const props = defineProps<{
   tasks: Task[]
   selectedTask: Task | null
   isSubmitting: boolean
+  uploadProgress: number | null
+  uploadLoadedBytes: number
+  uploadTotalBytes: number
   llmProviders: LLMProvider[]
   llmSettings: LLMSettings | null
+  activeProfileId: string
+  editingProfileId: string
+  profileFormState: { name: string; provider: string; base_url: string; model_id: string; temperature: number; api_key: string }
   isUpdatingLlmSettings: boolean
   isTestingLlm: boolean
+  isSwitchingProfile: boolean
   transcriptionSettings: TranscriptionSettings | null
   isUpdatingTranscriptionSettings: boolean
   summarizationSettings: SummarizationSettings | null
   isUpdatingSummarizationSettings: boolean
+  folders: Folder[]
+  folderTree: FolderTreeNode[]
 }>()
 
 const emit = defineEmits<{
@@ -69,6 +78,11 @@ const emit = defineEmits<{
   deleteTask: [taskId: string]
   showInfo: [task: Task]
   openSettings: []
+  createFolder: [name: string, parentId: string | null]
+  renameFolder: [folderId: string, newName: string]
+  deleteFolder: [folderId: string]
+  assignTaskToFolder: [taskId: string, folderId: string | null]
+  moveFolder: [folderId: string, newParentId: string | null]
   focusSearchMatch: [payload: {
     taskId: string
     keyword: string
@@ -76,19 +90,24 @@ const emit = defineEmits<{
     requestId: number
   }]
   updateLlmSettings: [payload: {
-    provider: string
+    profile_id: string
+    name?: string
+    provider?: string
     base_url?: string
     api_key?: string
     model_id?: string
     temperature?: number
   }]
+  switchActiveProfile: [profileId: string]
+  editProfile: [profileId: string]
+  createProfile: [name: string, provider: string]
+  deleteProfile: [profileId: string]
   updateTranscriptionSettings: [payload: {
     device?: 'cpu' | 'cuda'
     model_source?: 'auto_download' | 'manual_path'
     model_size?: 'tiny' | 'base' | 'small' | 'medium' | 'large'
     model_path?: string
     enable_bilibili_subtitle_fetch?: boolean
-    enable_asr_transcription?: boolean
     bilibili_sessdata?: string
     clear_bilibili_sessdata?: boolean
   }]
@@ -99,6 +118,8 @@ const emit = defineEmits<{
     boundary_jump_sec?: number
     auto_chunk_min_audio_duration_sec?: number
     auto_chunk_min_transcript_lines?: number
+    auto_chunk_min_plain_text_chars?: number
+    summary_detail_level?: number
     max_agent_value_chars?: number
     fallback_to_standard_on_agent_error?: boolean
   }]
@@ -106,17 +127,24 @@ const emit = defineEmits<{
 }>()
 
 const fileInput = ref<HTMLInputElement | null>(null)
-const subtitleFileInput = ref<HTMLInputElement | null>(null)
 const isSettingsPanelOpen = ref(false)
 const settingsTab = ref<'llm' | 'transcription' | 'summarization'>('llm')
 const sidebarTab = ref<'quick' | 'manage' | 'theme'>('quick')
 const showLocalPathHelp = ref(false)
 
-const llmProvider = ref('')
-const llmBaseUrl = ref('')
-const llmModelId = ref('')
 const llmApiKey = ref('')
-const llmTemperature = ref(0.7)
+const llmBaseUrl = computed({
+  get: () => props.profileFormState.base_url,
+  set: (v: string) => { props.profileFormState.base_url = v },
+})
+const llmModelId = computed({
+  get: () => props.profileFormState.model_id,
+  set: (v: string) => { props.profileFormState.model_id = v },
+})
+const llmTemperature = computed({
+  get: () => props.profileFormState.temperature,
+  set: (v: number) => { props.profileFormState.temperature = v },
+})
 const appVersion = __APP_VERSION__
 
 const transcriptionDevice = ref<'cpu' | 'cuda'>('cpu')
@@ -124,15 +152,16 @@ const transcriptionModelSource = ref<'auto_download' | 'manual_path'>('auto_down
 const transcriptionModelSize = ref<'tiny' | 'base' | 'small' | 'medium' | 'large'>('tiny')
 const transcriptionModelPathInput = ref('')
 const enableBilibiliSubtitleFetch = ref(true)
-const enableAsrTranscription = ref(false)
 const globalBilibiliSessdataInput = ref('')
 const chunkTargetDurationSec = ref(20)
-const chunkMinDurationSec = ref(10)
-const chunkMaxDurationSec = ref(30)
+const chunkMinDurationSec = ref(15)
+const chunkMaxDurationSec = ref(25)
 const boundaryJumpSec = ref(10)
 const autoChunkMinAudioDurationSec = ref(40)
 const autoChunkMinTranscriptLines = ref(1800)
-const maxAgentValueChars = ref(500)
+const autoChunkMinPlainTextChars = ref(6000)
+const summaryDetailLevel = ref(5)
+const maxAgentValueChars = ref(1000)
 const fallbackToStandardOnAgentError = ref(true)
 
 const secondsToMinutes = (seconds: number) => {
@@ -170,9 +199,6 @@ type SearchMatchSource = 'topic' | 'summary'
 const triggerFileUpload = () => {
   fileInput.value?.click()
 }
-const triggerSubtitleFileUpload = () => {
-  subtitleFileInput.value?.click()
-}
 
 const switchSummaryMode = (mode: Exclude<SummaryMode, 'auto'>) => {
   summaryMode.value = mode
@@ -192,6 +218,12 @@ const handleVideoUrlEnter = () => {
   handleSubmitAction()
 }
 
+const handleRawTranscriptEnter = () => {
+  if (props.isSubmitting) return
+  if (!rawTranscriptText.value.trim()) return
+  handleSubmitAction()
+}
+
 const handleLocalPathEnter = () => {
   if (props.isSubmitting) return
   if (!localFilePath.value.trim()) return
@@ -205,26 +237,21 @@ const handleFileChange = (event: Event) => {
     // 清空 URL 输入框（互斥模式）
     videoUrl.value = ''
     localFilePath.value = ''
-    inputSourceMode.value = 'bilibili'
+    rawTranscriptText.value = ''
     selectedFile.value = file
   }
 }
 
-const handleSubtitleFileChange = (event: Event) => {
-  const target = event.target as HTMLInputElement
-  const file = target.files?.[0]
-  if (file) {
-    selectedSubtitleFile.value = file
-    inputSourceMode.value = 'subtitle'
-    selectedFile.value = null
-    localFilePath.value = ''
-    videoUrl.value = ''
-  }
+const handleRawTranscriptInput = () => {
+  selectedFile.value = null
+  videoUrl.value = ''
+  localFilePath.value = ''
 }
 
 const handleLocalPathInput = (event: Event) => {
   selectedFile.value = null
   videoUrl.value = ''
+  rawTranscriptText.value = ''
 
   // 自动清理路径格式
   const input = event.target as HTMLInputElement
@@ -255,6 +282,18 @@ const formatFileSize = (bytes: number) => {
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
   return (bytes / 1024 / 1024).toFixed(1) + ' MB'
 }
+
+const normalizedUploadProgress = computed(() => {
+  const value = Number(props.uploadProgress ?? 0)
+  return Math.round(Math.max(0, Math.min(value, 100)))
+})
+
+const submitActionLabel = computed(() => {
+  if (!props.isSubmitting) return '开始处理'
+  if (props.uploadProgress === null) return '取消提交'
+  if (normalizedUploadProgress.value >= 100) return '上传完成，正在创建任务'
+  return `正在上传 ${normalizedUploadProgress.value}% · 点击取消`
+})
 
 const resolveTaskTopic = (task: Task) => {
   return task.topic || (task.summary && task.summary.match(/\{\{topic:?\s*(.*?)\}\}/i)?.[1]) || task.title || task.video_url
@@ -291,12 +330,12 @@ const buildMatchPreview = (text: string, keyword: string, context = 18): MatchPr
   }
 }
 
-const syncLlmSettings = (settings: LLMSettings | null) => {
-  if (!settings) return
-  llmProvider.value = settings.provider
-  llmBaseUrl.value = settings.base_url
-  llmModelId.value = settings.model_id
-  llmTemperature.value = settings.temperature
+const editingProfile = computed(() => {
+  if (!props.llmSettings) return null
+  return props.llmSettings.profiles.find(p => p.id === props.editingProfileId)
+})
+
+const syncLlmSettings = (_settings: LLMSettings | null) => {
   llmApiKey.value = ''
 }
 
@@ -307,7 +346,6 @@ const syncTranscriptionSettings = (settings: TranscriptionSettings | null) => {
   transcriptionModelSize.value = settings.model_size
   transcriptionModelPathInput.value = settings.model_path
   enableBilibiliSubtitleFetch.value = settings.enable_bilibili_subtitle_fetch
-  enableAsrTranscription.value = settings.enable_asr_transcription
 }
 
 const syncSummarizationSettings = (settings: SummarizationSettings | null) => {
@@ -318,6 +356,8 @@ const syncSummarizationSettings = (settings: SummarizationSettings | null) => {
   boundaryJumpSec.value = settings.boundary_jump_sec
   autoChunkMinAudioDurationSec.value = secondsToMinutes(settings.auto_chunk_min_audio_duration_sec)
   autoChunkMinTranscriptLines.value = settings.auto_chunk_min_transcript_lines
+  autoChunkMinPlainTextChars.value = settings.auto_chunk_min_plain_text_chars
+  summaryDetailLevel.value = settings.summary_detail_level
   maxAgentValueChars.value = settings.max_agent_value_chars
   fallbackToStandardOnAgentError.value = settings.fallback_to_standard_on_agent_error
 }
@@ -335,24 +375,20 @@ const requiredModelFilesLabel = computed(() => {
   return files.join(', ')
 })
 
-const handleProviderPresetChange = () => {
-  const provider = props.llmProviders.find((item) => item.id === llmProvider.value)
-  if (!provider) return
-  llmBaseUrl.value = provider.default_base_url
-  llmModelId.value = provider.default_model_id
-}
-
 const submitLlmSettings = () => {
-  if (!llmProvider.value || !llmBaseUrl.value || !llmModelId.value) return
+  if (!llmBaseUrl.value || !llmModelId.value) return
 
   const payload: {
-    provider: string
+    profile_id: string
+    name?: string
+    provider?: string
     base_url?: string
     api_key?: string
     model_id?: string
     temperature?: number
   } = {
-    provider: llmProvider.value,
+    profile_id: props.editingProfileId,
+    provider: props.profileFormState.provider,
     base_url: llmBaseUrl.value.trim(),
     model_id: llmModelId.value.trim(),
     temperature: llmTemperature.value,
@@ -373,15 +409,13 @@ const submitTranscriptionSettings = () => {
     model_size?: 'tiny' | 'base' | 'small' | 'medium' | 'large'
     model_path?: string
     enable_bilibili_subtitle_fetch?: boolean
-    enable_asr_transcription?: boolean
     bilibili_sessdata?: string
   } = {
     device: transcriptionDevice.value,
     model_source: transcriptionModelSource.value,
     model_size: transcriptionModelSize.value,
     model_path: transcriptionModelPathInput.value.trim(),
-    enable_bilibili_subtitle_fetch: enableBilibiliSubtitleFetch.value,
-    enable_asr_transcription: enableAsrTranscription.value,
+    enable_bilibili_subtitle_fetch: enableBilibiliSubtitleFetch.value
   }
   const cookie = globalBilibiliSessdataInput.value.trim()
   if (cookie) {
@@ -409,6 +443,8 @@ const submitSummarizationSettings = () => {
     boundary_jump_sec: Math.max(1, Number(boundaryJumpSec.value || 0)),
     auto_chunk_min_audio_duration_sec: autoAudioSec,
     auto_chunk_min_transcript_lines: Math.max(100, Number(autoChunkMinTranscriptLines.value || 0)),
+    auto_chunk_min_plain_text_chars: Math.max(1000, Number(autoChunkMinPlainTextChars.value || 0)),
+    summary_detail_level: Math.min(5, Math.max(1, Number(summaryDetailLevel.value || 5))),
     max_agent_value_chars: Math.max(100, Number(maxAgentValueChars.value || 0)),
     fallback_to_standard_on_agent_error: fallbackToStandardOnAgentError.value,
   })
@@ -453,17 +489,6 @@ const getTaskStatusLabel = (task: Task) => {
     return `总结中 (${Math.min(done, total)}/${total})`
   }
   return '总结中'
-}
-
-const getTaskProgress = (task: Task) => {
-  if (task.status === TaskStatus.SUMMARIZING) {
-    const total = Number(task.summary_chunk_total || 0)
-    const done = Number(task.summary_chunk_done || 0)
-    if (total > 0) {
-      return Math.max(0, Math.min(100, (done / total) * 100))
-    }
-  }
-  return Math.max(0, Math.min(100, Number(task.progress || 0)))
 }
 
 const getStatusClass = (status: TaskStatus) => {
@@ -611,19 +636,6 @@ const handleManagedResultClick = (result: ManagedTaskResult) => {
   })
 }
 
-// 进度条动画控制逻辑
-const prevProgressMap = ref<Record<string, number>>({})
-const shouldAnimateMap = ref<Record<string, boolean>>({})
-
-watch(() => props.tasks, (newTasks) => {
-  if (!newTasks) return
-  newTasks.forEach(task => {
-    const prevProgress = prevProgressMap.value[task.id] ?? 0
-    shouldAnimateMap.value[task.id] = task.progress >= prevProgress
-    prevProgressMap.value[task.id] = task.progress
-  })
-}, { deep: true, immediate: true })
-
 watch(() => props.llmSettings, (settings) => {
   syncLlmSettings(settings)
 }, { immediate: true })
@@ -743,26 +755,30 @@ watch(() => props.summarizationSettings, (settings) => {
               </div>
 
               <div v-if="settingsTab === 'llm'" class="space-y-2.5">
-                <div class="relative">
-                  <PhCpu :size="16" class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                  <select
-                    v-model="llmProvider"
-                    :disabled="props.isTestingLlm || props.isUpdatingLlmSettings"
-                    class="w-full pl-10 pr-3 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary disabled:opacity-50 disabled:cursor-not-allowed"
-                    @change="handleProviderPresetChange"
+                <!-- Profile selector (compact) -->
+                <div class="flex gap-1.5 overflow-x-auto">
+                  <button
+                    v-for="profile in llmSettings?.profiles || []"
+                    :key="profile.id"
+                    @click="emit('switchActiveProfile', profile.id)"
+                    :disabled="props.isSwitchingProfile || props.isTestingLlm || props.isUpdatingLlmSettings"
+                    :class="[
+                      'px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-all whitespace-nowrap flex items-center gap-1.5',
+                      props.activeProfileId === profile.id
+                        ? 'border-blue-300 bg-blue-50 text-blue-700'
+                        : 'border-gray-200 bg-white text-slate-500 hover:border-gray-300'
+                    ]"
                   >
-                    <option value="" disabled>选择 LLM 供应商</option>
-                    <option v-for="provider in llmProviders" :key="provider.id" :value="provider.id">
-                      {{ provider.label }}
-                    </option>
-                  </select>
+                    <span>{{ profile.name }}</span>
+                    <span v-if="profile.has_api_key" class="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block"></span>
+                  </button>
                 </div>
 
                 <input
                   v-model="llmBaseUrl"
                   type="text"
                   placeholder="Base URL"
-                  :disabled="props.isTestingLlm || props.isUpdatingLlmSettings"
+                  :disabled="props.isTestingLlm || props.isUpdatingLlmSettings || props.isSwitchingProfile"
                   class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary disabled:opacity-50 disabled:cursor-not-allowed"
                 >
 
@@ -770,7 +786,7 @@ watch(() => props.summarizationSettings, (settings) => {
                   v-model="llmModelId"
                   type="text"
                   placeholder="模型 ID"
-                  :disabled="props.isTestingLlm || props.isUpdatingLlmSettings"
+                  :disabled="props.isTestingLlm || props.isUpdatingLlmSettings || props.isSwitchingProfile"
                   class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary disabled:opacity-50 disabled:cursor-not-allowed"
                 >
 
@@ -781,7 +797,7 @@ watch(() => props.summarizationSettings, (settings) => {
                   max="2"
                   step="0.1"
                   placeholder="Temperature"
-                  :disabled="props.isTestingLlm || props.isUpdatingLlmSettings"
+                  :disabled="props.isTestingLlm || props.isUpdatingLlmSettings || props.isSwitchingProfile"
                   class="w-full px-3 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary disabled:opacity-50 disabled:cursor-not-allowed"
                 >
 
@@ -791,19 +807,19 @@ watch(() => props.summarizationSettings, (settings) => {
                     v-model="llmApiKey"
                     type="password"
                     placeholder="留空则保持当前 API Key"
-                    :disabled="props.isTestingLlm || props.isUpdatingLlmSettings"
+                    :disabled="props.isTestingLlm || props.isUpdatingLlmSettings || props.isSwitchingProfile"
                     class="w-full pl-10 pr-3 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                 </div>
 
-                <p v-if="llmSettings?.has_api_key" class="text-[11px] text-slate-500">
-                  当前 API Key: {{ llmSettings.api_key_hint }}
+                <p v-if="editingProfile?.has_api_key" class="text-[11px] text-slate-500">
+                  当前 API Key: {{ editingProfile?.api_key_hint }}
                 </p>
 
                 <div class="space-y-2 pt-1">
                   <button
                     @click="submitLlmSettings"
-                    :disabled="props.isTestingLlm || props.isUpdatingLlmSettings || !llmProvider || !llmBaseUrl || !llmModelId"
+                    :disabled="props.isTestingLlm || props.isUpdatingLlmSettings || props.isSwitchingProfile || !llmBaseUrl || !llmModelId"
                     class="w-full bg-slate-800 hover:bg-slate-700 text-white py-2.5 rounded-lg text-sm font-medium transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                   >
                     <PhFloppyDisk :size="16" weight="fill" />
@@ -812,7 +828,7 @@ watch(() => props.summarizationSettings, (settings) => {
                   </button>
                   <button
                     @click="handleTestLlm"
-                    :disabled="props.isTestingLlm || props.isUpdatingLlmSettings || !llmProvider || !llmBaseUrl || !llmModelId"
+                    :disabled="props.isTestingLlm || props.isUpdatingLlmSettings || props.isSwitchingProfile || !llmBaseUrl || !llmModelId"
                     class="w-full bg-blue-500 hover:bg-blue-600 text-white py-2.5 rounded-lg text-sm font-medium transition-all disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-2"
                   >
                     <PhSpinner v-if="props.isTestingLlm" :size="16" class="animate-spin" />
@@ -957,7 +973,7 @@ watch(() => props.summarizationSettings, (settings) => {
                   <div class="flex-1 min-w-0">
                     <p class="text-sm font-medium text-slate-700">优先使用 B 站字幕</p>
                     <p class="text-[11px] text-slate-500 leading-relaxed mt-0.5">
-                      仅对 B 站链接生效；默认不回退 ASR
+                      仅对 B 站链接生效；未获取到字幕时自动回退到下载+ASR
                     </p>
                   </div>
                   <button
@@ -973,31 +989,6 @@ watch(() => props.summarizationSettings, (settings) => {
                       :class="[
                         'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
                         enableBilibiliSubtitleFetch ? 'translate-x-5' : 'translate-x-0'
-                      ]"
-                    ></span>
-                  </button>
-                </div>
-
-                <div class="flex items-center justify-between gap-3 px-3 py-3 rounded-xl border border-gray-200 bg-gray-50/50">
-                  <div class="flex-1 min-w-0">
-                    <p class="text-sm font-medium text-slate-700">允许模型语音识别（ASR）</p>
-                    <p class="text-[11px] text-slate-500 leading-relaxed mt-0.5">
-                      关闭时不会加载/使用语音识别模型；仅能依赖字幕来源。
-                    </p>
-                  </div>
-                  <button
-                    @click="enableAsrTranscription = !enableAsrTranscription"
-                    :class="[
-                      'relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2',
-                      enableAsrTranscription ? 'bg-blue-500' : 'bg-gray-300'
-                    ]"
-                    role="switch"
-                    :aria-checked="enableAsrTranscription"
-                  >
-                    <span
-                      :class="[
-                        'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
-                        enableAsrTranscription ? 'translate-x-5' : 'translate-x-0'
                       ]"
                     ></span>
                   </button>
@@ -1109,6 +1100,16 @@ watch(() => props.summarizationSettings, (settings) => {
                         class="w-full px-2.5 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
                       >
                     </label>
+                    <label class="space-y-1">
+                      <span class="text-[11px] text-slate-500">纯文本字符达到</span>
+                      <input
+                        v-model.number="autoChunkMinPlainTextChars"
+                        type="number"
+                        min="1000"
+                        step="500"
+                        class="w-full px-2.5 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                      >
+                    </label>
                   </div>
                 </div>
 
@@ -1135,12 +1136,23 @@ watch(() => props.summarizationSettings, (settings) => {
                         class="w-full px-2.5 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
                       >
                     </label>
+                    <label class="space-y-1">
+                      <span class="text-[11px] text-slate-500">总结详细度(1-5)</span>
+                      <input
+                        v-model.number="summaryDetailLevel"
+                        type="number"
+                        min="1"
+                        max="5"
+                        step="1"
+                        class="w-full px-2.5 py-2 bg-gray-50 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary"
+                      >
+                    </label>
                   </div>
                 </div>
 
                 <div class="flex items-center justify-between gap-3 px-3 py-3 rounded-xl border border-gray-200 bg-gray-50/50">
                   <div class="flex-1 min-w-0">
-                    <p class="text-sm font-medium text-slate-700">Agent 失败自动回退标准模式</p>
+                    <p class="text-sm font-medium text-slate-700">Agent 失败自动回退通用模式</p>
                     <p class="text-[11px] text-slate-500 leading-relaxed mt-0.5">
                       开启后遇到分块异常会自动降级，保证任务尽量产出结果。
                     </p>
@@ -1180,49 +1192,14 @@ watch(() => props.summarizationSettings, (settings) => {
           <!-- 提交新任务 -->
           <div class="p-3 pb-2">
             <div class="space-y-2.5">
-              <div class="grid grid-cols-2 gap-2">
-                <button
-                  type="button"
-                  @click="inputSourceMode = 'bilibili'"
-                  :class="[
-                    'px-3 py-2 rounded-lg border text-xs font-medium transition-colors',
-                    inputSourceMode === 'bilibili'
-                      ? 'border-blue-300 bg-blue-50 text-blue-700'
-                      : 'border-gray-200 bg-gray-50 text-slate-600'
-                  ]"
-                >
-                  B站字幕
-                </button>
-                <button
-                  type="button"
-                  @click="inputSourceMode = 'subtitle'; videoUrl = ''; selectedFile = null; localFilePath = ''"
-                  :class="[
-                    'px-3 py-2 rounded-lg border text-xs font-medium transition-colors',
-                    inputSourceMode === 'subtitle'
-                      ? 'border-blue-300 bg-blue-50 text-blue-700'
-                      : 'border-gray-200 bg-gray-50 text-slate-600'
-                  ]"
-                >
-                  上传/粘贴字幕
-                </button>
-              </div>
-
-              <input
-                v-model="taskTitle"
-                type="text"
-                placeholder="请输入任务标题（必填，展示名）"
-                class="w-full px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
-              >
-
               <div class="relative">
                 <PhLink :size="18" class="absolute left-3 top-3 text-slate-400" />
                 <input
                   v-model="videoUrl"
                   type="text"
-                  placeholder="粘贴 B 站视频 URL"
+                  placeholder="粘贴视频 URL (如 Bilibili)"
                   class="w-full pl-10 pr-12 py-2.5 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
-                  :disabled="inputSourceMode !== 'bilibili'"
-                  @input="selectedFile = null; localFilePath = ''; inputSourceMode = 'bilibili'"
+                  @input="selectedFile = null; localFilePath = ''; rawTranscriptText = ''"
                   @keydown.enter.prevent="handleVideoUrlEnter"
                 >
                 <button
@@ -1243,32 +1220,16 @@ watch(() => props.summarizationSettings, (settings) => {
                 >
               </div>
 
-              <div v-if="inputSourceMode === 'subtitle'" class="space-y-2">
-                <div class="flex items-center gap-2">
-                  <button
-                    type="button"
-                    @click="triggerSubtitleFileUpload"
-                    class="px-3 py-2 rounded-lg border border-gray-200 bg-gray-50 hover:bg-gray-100 text-xs text-slate-700"
-                  >
-                    上传字幕文件(.txt/.srt/.vtt)
-                  </button>
-                  <input
-                    ref="subtitleFileInput"
-                    type="file"
-                    accept=".txt,.srt,.vtt,text/plain"
-                    class="hidden"
-                    @change="handleSubtitleFileChange"
-                  >
-                  <span v-if="selectedSubtitleFile" class="text-xs text-slate-500 truncate">
-                    {{ selectedSubtitleFile.name }}
-                  </span>
-                </div>
+              <div class="relative">
                 <textarea
-                  v-model="subtitleText"
+                  v-model="rawTranscriptText"
                   rows="5"
-                  placeholder="也可以直接粘贴字幕文本（支持无时间戳纯文本）"
-                  class="w-full px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm"
-                />
+                  placeholder="粘贴无时间戳转录文本"
+                  class="w-full px-3 py-2.5 bg-gray-50 border border-gray-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary transition-all text-sm leading-5 resize-y min-h-[112px]"
+                  @input="handleRawTranscriptInput"
+                  @keydown.ctrl.enter.prevent="handleRawTranscriptEnter"
+                  @keydown.meta.enter.prevent="handleRawTranscriptEnter"
+                ></textarea>
               </div>
 
               <div
@@ -1318,115 +1279,145 @@ watch(() => props.summarizationSettings, (settings) => {
                 </button>
               </div>
 
-              <div v-if="!props.isLocalClient && selectedFile" class="flex items-center gap-2 px-3 py-2 bg-blue-50 border border-blue-100 rounded-lg text-sm">
-                <div class="flex-1 min-w-0">
-                  <p class="font-medium text-slate-700 truncate">{{ selectedFile.name }}</p>
-                  <p class="text-xs text-slate-500">{{ formatFileSize(selectedFile.size) }}</p>
+              <div
+                v-if="!props.isLocalClient && selectedFile"
+                class="relative overflow-hidden rounded-xl border border-blue-100 bg-gradient-to-br from-blue-50 via-white to-cyan-50/70 text-sm shadow-sm"
+              >
+                <div class="flex items-center gap-3 px-3 py-3">
+                  <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-white text-blue-500 shadow-sm ring-1 ring-blue-100">
+                    <PhUpload :size="18" weight="duotone" />
+                  </div>
+                  <div class="min-w-0 flex-1">
+                    <p class="truncate font-medium text-slate-700">{{ selectedFile.name }}</p>
+                    <div class="mt-0.5 flex items-center justify-between gap-2 text-[11px] text-slate-500">
+                      <span v-if="uploadProgress === null">等待上传 · {{ formatFileSize(selectedFile.size) }}</span>
+                      <span v-else-if="normalizedUploadProgress < 100">
+                        {{ formatFileSize(uploadLoadedBytes) }} / {{ formatFileSize(uploadTotalBytes || selectedFile.size) }}
+                      </span>
+                      <span v-else>文件已送达，正在创建处理任务</span>
+                      <span v-if="uploadProgress !== null" class="shrink-0 font-semibold tabular-nums text-blue-600">
+                        {{ normalizedUploadProgress }}%
+                      </span>
+                    </div>
+                  </div>
+                  <button
+                    @click="handleClearSelectedFile"
+                    class="rounded-lg p-1.5 text-slate-400 transition-colors hover:bg-red-50 hover:text-red-500"
+                    :title="props.isSubmitting ? '取消上传' : '清除文件'"
+                  >
+                    <PhX :size="16" />
+                  </button>
                 </div>
-                <button
-                  @click="handleClearSelectedFile"
-                  class="p-1 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors"
-                  title="清除文件"
-                >
-                  <PhX :size="16" />
-                </button>
+                <div v-if="uploadProgress !== null" class="h-1.5 overflow-hidden bg-blue-100/80">
+                  <div
+                    class="upload-progress-fill h-full rounded-r-full transition-[width] duration-300 ease-out"
+                    :style="{ width: `${normalizedUploadProgress}%` }"
+                  ></div>
+                </div>
               </div>
 
               <div class="relative">
-                <div class="relative flex bg-gray-100 p-1 rounded-2xl transition-all duration-200 overflow-visible">
-                  <div
-                    class="absolute top-1 bottom-1 w-[calc(50%-4px)] rounded-xl transition-all duration-300 ease-out"
-                    :class="summaryMode === 'standard'
-                      ? 'left-1 bg-white shadow-sm'
-                      : 'left-[calc(50%)] agent-gradient shadow-[0_8px_24px_rgba(59,130,246,0.35)]'"
-                  ></div>
-
-                  <div
-                    class="pointer-events-none absolute -right-3 -bottom-3 h-10 w-28 rounded-full agent-glow blur-xl transition-opacity duration-300"
-                    :class="summaryMode === 'agent' ? 'opacity-100' : 'opacity-0'"
-                  ></div>
-
+                <div class="mode-switch-shell relative grid grid-cols-2 gap-1 overflow-hidden rounded-2xl border border-slate-200/70 bg-slate-100 p-1">
+                  <span
+                    class="mode-switch-indicator pointer-events-none absolute bottom-1 top-1 rounded-xl"
+                    :class="summaryMode === 'agent' ? 'mode-switch-indicator--agent agent-gradient' : 'mode-switch-indicator--standard'"
+                  ></span>
                   <button
                     type="button"
                     @click="switchSummaryMode('standard')"
-                    class="relative z-10 flex-1 px-3 py-2 rounded-xl text-xs font-medium transition-colors inline-flex items-center justify-center gap-1.5"
-                    :class="summaryMode === 'standard' ? 'text-primary' : 'text-slate-500 hover:text-slate-700'"
+                    class="mode-switch-button relative z-10 inline-flex items-center justify-center gap-1.5 rounded-xl px-2 py-2 text-xs font-medium"
+                    :class="summaryMode === 'standard' ? 'mode-switch-button--active text-blue-600' : 'text-slate-500 hover:text-slate-700'"
+                    :aria-pressed="summaryMode === 'standard'"
                   >
-                    <PhLightning :size="13" :weight="summaryMode === 'standard' ? 'fill' : 'regular'" />
-                    <span>标准模式</span>
+                    <PhLightning class="mode-switch-icon" :size="13" :weight="summaryMode === 'standard' ? 'fill' : 'regular'" />
+                    <span>通用模式</span>
                   </button>
                   <button
                     type="button"
                     @click="switchSummaryMode('agent')"
-                    class="relative z-10 flex-1 px-3 py-2 rounded-xl text-xs font-medium transition-colors inline-flex items-center justify-center gap-1.5"
-                    :class="summaryMode === 'agent' ? 'text-white' : 'text-slate-500 hover:text-slate-700'"
+                    class="mode-switch-button relative z-10 inline-flex items-center justify-center gap-1.5 rounded-xl px-2 py-2 text-xs font-medium"
+                    :class="summaryMode === 'agent' ? 'mode-switch-button--active text-white' : 'text-slate-500 hover:text-slate-700'"
+                    :aria-pressed="summaryMode === 'agent'"
                   >
-                    <PhBrain :size="13" :weight="summaryMode === 'agent' ? 'fill' : 'regular'" />
+                    <PhBrain class="mode-switch-icon" :size="13" :weight="summaryMode === 'agent' ? 'fill' : 'regular'" />
                     <span>Agent 模式</span>
                   </button>
                 </div>
+                <Transition name="mode-caption" mode="out-in">
+                  <div
+                    :key="summaryMode"
+                    class="mt-1.5 flex items-center gap-1.5 px-1 text-[10px]"
+                    :class="summaryMode === 'agent' ? 'text-indigo-500' : 'text-slate-400'"
+                  >
+                    <PhBrain v-if="summaryMode === 'agent'" :size="11" weight="fill" />
+                    <PhLightning v-else :size="11" weight="fill" />
+                    <span>{{ summaryMode === 'agent' ? '长内容分块理解，再统一整合' : '快速生成结构化完整总结' }}</span>
+                  </div>
+                </Transition>
               </div>
 
               <button
+                type="button"
+                class="flex w-full items-center justify-between gap-3 rounded-2xl border px-3 py-2.5 text-left transition-all"
+                :class="beautifySummary
+                  ? 'border-blue-200 bg-blue-50/80 text-blue-700 shadow-sm shadow-blue-100/60'
+                  : 'border-slate-200/80 bg-white text-slate-600 hover:border-slate-300'"
+                role="switch"
+                :aria-checked="beautifySummary"
+                @click="beautifySummary = !beautifySummary"
+              >
+                <span class="flex min-w-0 items-center gap-2.5">
+                  <span
+                    class="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl"
+                    :class="beautifySummary ? 'bg-blue-500 text-white' : 'bg-slate-100 text-slate-500'"
+                  >
+                    <PhSparkle :size="16" :weight="beautifySummary ? 'fill' : 'regular'" />
+                  </span>
+                  <span class="min-w-0">
+                    <span class="block text-xs font-semibold">结果美化</span>
+                    <span class="block truncate text-[10px] opacity-70">
+                      {{ beautifySummary ? '使用报告化提示词与图形组件' : '使用原提示词与经典排版' }}
+                    </span>
+                  </span>
+                </span>
+                <span
+                  class="relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors duration-200"
+                  :class="beautifySummary ? 'bg-blue-500' : 'bg-slate-300'"
+                >
+                  <span
+                    class="absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-200"
+                    :class="beautifySummary ? 'translate-x-[18px]' : 'translate-x-0.5'"
+                  ></span>
+                </span>
+              </button>
+
+              <button
                 @click="handleSubmitAction"
-                :disabled="!isSubmitting && (inputSourceMode === 'subtitle' ? (!selectedSubtitleFile && !subtitleText.trim()) : (!videoUrl && (!props.isLocalClient ? !selectedFile : !localFilePath)))"
+                :disabled="!isSubmitting && (!rawTranscriptText.trim() && !videoUrl && (!props.isLocalClient ? !selectedFile : !localFilePath))"
                 class="w-full bg-primary hover:bg-secondary text-white py-2.5 rounded-xl font-semibold transition-all shadow-sm shadow-blue-100 flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed active:scale-95"
               >
                 <PhSpinner v-if="isSubmitting" :size="18" class="animate-spin" />
                 <PhPlayCircle v-else :size="18" />
-                {{ isSubmitting ? '取消提交' : '开始处理' }}
+                {{ submitActionLabel }}
               </button>
             </div>
           </div>
 
           <div class="flex-1 overflow-y-auto p-4 custom-scrollbar">
-            <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wider mb-3 px-2">任务管理</h2>
-            <div class="space-y-2">
-              <div
-                v-for="task in tasks"
-                :key="task.id"
-                @click="() => { emit('selectTask', task); isSidebarOpen = false; }"
-                :class="['p-3 rounded-2xl border cursor-pointer transition-all hover:shadow-sm active:scale-[0.98] group relative',
-                         selectedTask?.id === task.id ? 'border-blue-200 bg-blue-50/60 ring-1 ring-primary/20 shadow-sm' : 'border-transparent hover:bg-white hover:border-gray-100']"
-              >
-                <div class="flex justify-between items-start mb-1">
-                  <span :class="['text-xs font-medium px-2 py-0.5 rounded-full flex items-center gap-1', getStatusClass(task.status)]">
-                    <component :is="getStatusIcon(task.status)" :size="12" :class="task.status !== TaskStatus.COMPLETED && task.status !== TaskStatus.FAILED && task.status !== TaskStatus.PENDING ? 'animate-spin' : ''" />
-                    {{ getTaskStatusLabel(task) }}
-                  </span>
-                  <div class="flex items-center gap-2">
-                    <span class="text-[10px] text-slate-400">{{ formatTaskDate(task.created_at) }}</span>
-                    <div :class="['flex items-center gap-1', 'md:opacity-0 md:group-hover:opacity-100', 'md:transition-opacity']">
-                      <button
-                        @click.stop="emit('showInfo', task)"
-                        class="text-slate-400 hover:text-blue-500 p-1"
-                        title="查看信息"
-                      >
-                        <PhInfo :size="14" />
-                      </button>
-                      <button
-                        @click.stop="emit('deleteTask', task.id)"
-                        class="text-slate-400 hover:text-red-500 p-1"
-                        title="删除任务"
-                      >
-                        <PhTrash :size="14" />
-                      </button>
-                    </div>
-                  </div>
-                </div>
-                <div class="text-sm font-medium text-slate-700 truncate" :title="resolveTaskTopic(task)">
-                  {{ resolveTaskTopic(task) }}
-                </div>
-                <div v-if="task.status === TaskStatus.DOWNLOADING || task.status === TaskStatus.UPLOADING || task.status === TaskStatus.TRANSCRIBING || task.status === TaskStatus.SUMMARIZING" class="w-full bg-blue-100 h-1 rounded-full mt-2 overflow-hidden">
-                  <div
-                    class="bg-blue-500 h-full rounded-full"
-                    :class="{ 'transition-all duration-500': shouldAnimateMap[task.id] }"
-                    :style="{ width: getTaskProgress(task) + '%' }"
-                  ></div>
-                </div>
-              </div>
-              <p v-if="tasks.length === 0" class="text-center text-gray-400 py-8 text-sm">暂无任务记录</p>
-            </div>
+            <FolderBrowser
+              :tasks="tasks"
+              :folders="folders"
+              :folderTree="folderTree"
+              :selectedTask="selectedTask"
+              @selectTask="(task) => { emit('selectTask', task); isSidebarOpen = false; }"
+              @deleteTask="emit('deleteTask', $event)"
+              @showInfo="emit('showInfo', $event)"
+              @createFolder="(name: any, parentId: any) => emit('createFolder', name, parentId)"
+              @renameFolder="(folderId: any, newName: any) => emit('renameFolder', folderId, newName)"
+              @deleteFolder="emit('deleteFolder', $event)"
+              @assignTaskToFolder="(taskId: any, folderId: any) => emit('assignTaskToFolder', taskId, folderId)"
+              @moveFolder="(folderId: any, newParentId: any) => emit('moveFolder', folderId, newParentId)"
+            />
           </div>
         </template>
 
@@ -1489,8 +1480,11 @@ watch(() => props.summarizationSettings, (settings) => {
                     </span>
                   </div>
                 </div>
-                <div class="text-[13px] leading-5 font-medium text-slate-700 line-clamp-2" :title="resolveTaskTopic(result.task)">
-                  {{ resolveTaskTopic(result.task) }}
+                <div class="text-[13px] leading-5 font-medium text-slate-700 line-clamp-2" :title="result.task.title || result.task.video_url">
+                  {{ result.task.title || result.task.video_url }}
+                </div>
+                <div v-if="result.task.topic" class="text-[11px] text-slate-400 truncate mt-0.5" :title="result.task.topic">
+                  {{ result.task.topic }}
                 </div>
 
                 <div v-if="manageKeyword.trim()" class="mt-1.5 space-y-0.5">
@@ -1551,6 +1545,76 @@ watch(() => props.summarizationSettings, (settings) => {
   transform: translateY(-8px);
 }
 
+.upload-progress-fill {
+  background: linear-gradient(90deg, #22d3ee, #3b82f6, #6366f1, #3b82f6, #22d3ee);
+  background-size: 220% 100%;
+  animation: upload-progress-flow 1.8s linear infinite;
+}
+
+.mode-switch-shell {
+  box-shadow: inset 0 1px 2px rgba(15, 23, 42, 0.04);
+}
+
+.mode-switch-indicator {
+  left: 4px;
+  width: calc((100% - 12px) / 2);
+  transition:
+    transform 460ms cubic-bezier(0.22, 1, 0.36, 1),
+    box-shadow 320ms ease,
+    background-color 320ms ease;
+  will-change: transform;
+}
+
+.mode-switch-indicator--standard {
+  background: rgba(255, 255, 255, 0.98);
+  box-shadow: 0 3px 10px rgba(15, 23, 42, 0.09), 0 0 0 1px rgba(226, 232, 240, 0.7);
+  transform: translateX(0);
+}
+
+.mode-switch-indicator--agent {
+  box-shadow: 0 6px 18px -5px rgba(79, 70, 229, 0.65), 0 0 0 1px rgba(255, 255, 255, 0.16);
+  transform: translateX(calc(100% + 4px));
+}
+
+.mode-switch-button {
+  transition: color 260ms ease, transform 260ms ease;
+}
+
+.mode-switch-button:active {
+  transform: scale(0.97);
+}
+
+.mode-switch-button--active .mode-switch-icon {
+  animation: mode-icon-bloom 420ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.mode-caption-enter-active,
+.mode-caption-leave-active {
+  transition: opacity 180ms ease, transform 220ms ease, filter 180ms ease;
+}
+
+.mode-caption-enter-from {
+  opacity: 0;
+  filter: blur(3px);
+  transform: translateY(4px);
+}
+
+.mode-caption-leave-to {
+  opacity: 0;
+  filter: blur(3px);
+  transform: translateY(-4px);
+}
+
+@keyframes upload-progress-flow {
+  to { background-position: -220% 0; }
+}
+
+@keyframes mode-icon-bloom {
+  0% { opacity: 0.35; transform: scale(0.55) rotate(-18deg); }
+  65% { transform: scale(1.24) rotate(5deg); }
+  100% { opacity: 1; transform: scale(1) rotate(0); }
+}
+
 /* Agent 模式极光流动动画 */
 @keyframes aurora-flow {
   0% {
@@ -1595,7 +1659,7 @@ watch(() => props.summarizationSettings, (settings) => {
     #06b6d4
   );
   background-size: 180% 180%;
-  animation: aurora-flow 12s ease-in-out infinite;
+  animation: aurora-flow 6s ease-in-out infinite;
 }
 
 .agent-glow {
@@ -1610,6 +1674,23 @@ watch(() => props.summarizationSettings, (settings) => {
     rgba(6, 182, 212, 0.25)
   );
   background-size: 180% 180%;
-  animation: aurora-flow 12s ease-in-out infinite;
+  animation: aurora-flow 6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .upload-progress-fill,
+  .mode-switch-button--active .mode-switch-icon,
+  .agent-gradient,
+  .agent-glow {
+    animation: none;
+  }
+
+  .mode-switch-indicator,
+  .mode-switch-button,
+  .mode-caption-enter-active,
+  .mode-caption-leave-active {
+    transition: none;
+  }
 }
 </style>
+

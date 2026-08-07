@@ -157,19 +157,29 @@ class LiteLLMClient(LLM):
 
                 try:
                     response_generator = await litellm.acompletion(**kwargs)
+                    emitted_content = False
 
                     if stream_opt:
                         async for chunk in response_generator:
                             # 提取流式响应中的文本内容
                             content = chunk.choices[0].delta.content
                             if content:
+                                emitted_content = True
                                 resp_callback(content)
                     else:
                         # 非流式响应
                         content = response_generator.choices[0].message.content
                         if content:
+                            emitted_content = True
                             resp_callback(content)
-                    return
+                    if emitted_content:
+                        return
+                    last_exception = RuntimeError(
+                        f"模型返回空内容（stream={stream_opt}, temperature={with_temperature}）"
+                    )
+                    if can_retry_more:
+                        continue
+                    break
                 except asyncio.CancelledError:
                     # 任务被上层主动取消（例如任务删除），直接向上传播以便立即释放 Worker。
                     raise

@@ -9,17 +9,36 @@ import {
   PhBrain,
   PhMicrophone,
   PhGitBranch,
+  PhCheckCircle,
+  PhLightning,
+  PhRocket,
+  PhDesktop,
+  PhPlus,
+  PhTrash,
 } from '@phosphor-icons/vue'
-import type { LLMProvider, LLMSettings, TranscriptionSettings, SummarizationSettings } from '../types'
+import type {
+  LLMProvider,
+  LLMSettings,
+  TranscriptionSettings,
+  SummarizationSettings,
+  TingwuAuthCheckResult,
+} from '../types'
 
 const props = defineProps<{
   isOpen: boolean
   llmProviders: LLMProvider[]
   llmSettings: LLMSettings | null
+  activeProfileId: string
+  editingProfileId: string
+  profileFormState: { name: string; provider: string; base_url: string; model_id: string; temperature: number; api_key: string }
   isUpdatingLlmSettings: boolean
   isTestingLlm: boolean
+  isSwitchingProfile: boolean
   transcriptionSettings: TranscriptionSettings | null
   isUpdatingTranscriptionSettings: boolean
+  isCheckingTingwuAuth: boolean
+  isUpdatingTingwuSession: boolean
+  tingwuAuthCheckResult: TingwuAuthCheckResult | null
   summarizationSettings: SummarizationSettings | null
   isUpdatingSummarizationSettings: boolean
   isReadingBilibiliCookieFromBrowser: boolean
@@ -27,31 +46,44 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   close: []
+  switchActiveProfile: [profileId: string]
+  editProfile: [profileId: string]
+  createProfile: [name: string, provider: string]
+  deleteProfile: [profileId: string]
   updateLlmSettings: [payload: {
-    provider: string
+    profile_id: string
+    name?: string
+    provider?: string
     base_url?: string
     api_key?: string
     model_id?: string
     temperature?: number
   }]
-  testLlm: []
   updateLlmSettingsAndTest: [payload: {
-    provider: string
+    profile_id: string
+    name?: string
+    provider?: string
     base_url?: string
     api_key?: string
     model_id?: string
     temperature?: number
   }]
   updateTranscriptionSettings: [payload: {
+    tingwu_enabled?: boolean
+    tingwu_config_path?: string
+    tingwu_poll_interval_sec?: number
+    tingwu_timeout_sec?: number
+    tingwu_fallback_to_whisper?: boolean
     device?: 'cpu' | 'cuda'
     model_source?: 'auto_download' | 'manual_path'
     model_size?: 'tiny' | 'base' | 'small' | 'medium' | 'large'
     model_path?: string
     enable_bilibili_subtitle_fetch?: boolean
-    enable_asr_transcription?: boolean
     bilibili_sessdata?: string
     clear_bilibili_sessdata?: boolean
   }]
+  checkTingwuAuth: []
+  updateTingwuSession: [session: string]
   readBilibiliCookieFromBrowser: []
   updateSummarizationSettings: [payload: {
     chunk_target_duration_sec?: number
@@ -60,6 +92,8 @@ const emit = defineEmits<{
     boundary_jump_sec?: number
     auto_chunk_min_audio_duration_sec?: number
     auto_chunk_min_transcript_lines?: number
+    auto_chunk_min_plain_text_chars?: number
+    summary_detail_level?: number
     max_agent_value_chars?: number
     fallback_to_standard_on_agent_error?: boolean
   }]
@@ -67,30 +101,92 @@ const emit = defineEmits<{
 
 const settingsTab = ref<'llm' | 'transcription' | 'summarization'>('llm')
 
-// LLM 设置
-const llmProvider = ref('')
-const llmBaseUrl = ref('')
-const llmModelId = ref('')
-const llmTemperature = ref(0.7)
+// LLM Profile form — bound to profileFormState prop
+const llmProfileName = computed({
+  get: () => props.profileFormState.name,
+  set: (v: string) => { props.profileFormState.name = v },
+})
+const llmBaseUrl = computed({
+  get: () => props.profileFormState.base_url,
+  set: (v: string) => { props.profileFormState.base_url = v },
+})
+const llmModelId = computed({
+  get: () => props.profileFormState.model_id,
+  set: (v: string) => { props.profileFormState.model_id = v },
+})
+const llmTemperature = computed({
+  get: () => props.profileFormState.temperature,
+  set: (v: number) => { props.profileFormState.temperature = v },
+})
 const llmApiKey = ref('')
 
+// Editing profile info
+const editingProfile = computed(() => {
+  if (!props.llmSettings) return null
+  return props.llmSettings.profiles.find(p => p.id === props.editingProfileId)
+})
+
+
+const providerIcon = (providerId: string) => {
+  switch (providerId) {
+    case 'openai_compatible': return PhRocket
+    case 'openai': return PhLightning
+    case 'openrouter': return PhGitBranch
+    case 'ollama': return PhDesktop
+    case 'deepseek': return PhBrain
+    default: return PhCpu
+  }
+}
+
+// New profile creation dialog
+const isCreatingProfile = ref(false)
+const newProfileName = ref('')
+const newProfileProvider = ref('openai_compatible')
+
+const openCreateProfileDialog = () => {
+  newProfileName.value = ''
+  newProfileProvider.value = 'openai_compatible'
+  isCreatingProfile.value = true
+}
+
+const handleCreateProfile = () => {
+  if (!newProfileName.value.trim()) return
+  emit('createProfile', newProfileName.value.trim(), newProfileProvider.value)
+  isCreatingProfile.value = false
+}
+
+const handleSelectProfile = (profileId: string) => {
+  emit('switchActiveProfile', profileId)
+}
+
+const handleDeleteProfile = (profileId: string) => {
+  emit('deleteProfile', profileId)
+}
+
 // 转录设置
+const tingwuEnabled = ref(true)
+const tingwuConfigPath = ref('tingwu/config.json')
+const tingwuPollIntervalSec = ref(10)
+const tingwuTimeoutSec = ref(14400)
+const tingwuFallbackToWhisper = ref(false)
+const tingwuSessionInput = ref('')
 const transcriptionDevice = ref<'cpu' | 'cuda'>('cpu')
 const transcriptionModelSource = ref<'auto_download' | 'manual_path'>('auto_download')
 const transcriptionModelSize = ref<'tiny' | 'base' | 'small' | 'medium' | 'large'>('tiny')
 const transcriptionModelPathInput = ref('')
 const enableBilibiliSubtitleFetch = ref(true)
-const enableAsrTranscription = ref(false)
 const globalBilibiliSessdataInput = ref('')
 
 // Agent 设置
 const chunkTargetDurationSec = ref(20)
-const chunkMinDurationSec = ref(10)
-const chunkMaxDurationSec = ref(30)
+const chunkMinDurationSec = ref(15)
+const chunkMaxDurationSec = ref(25)
 const boundaryJumpSec = ref(10)
 const autoChunkMinAudioDurationSec = ref(40)
 const autoChunkMinTranscriptLines = ref(1800)
-const maxAgentValueChars = ref(500)
+const autoChunkMinPlainTextChars = ref(6000)
+const summaryDetailLevel = ref(5)
+const maxAgentValueChars = ref(1000)
 const fallbackToStandardOnAgentError = ref(true)
 
 const secondsToMinutes = (seconds: number) => {
@@ -114,26 +210,26 @@ const requiredModelFilesLabel = computed(() => {
   return files.join(', ')
 })
 
-watch(() => props.llmSettings, (settings) => {
-  if (settings) {
-    llmProvider.value = settings.provider || ''
-    llmBaseUrl.value = settings.base_url || ''
-    llmModelId.value = settings.model_id || ''
-    llmTemperature.value = settings.temperature ?? 0.7
-    llmApiKey.value = ''
-  }
-}, { immediate: true })
-
 watch(() => props.transcriptionSettings, (settings) => {
   if (settings) {
+    tingwuEnabled.value = settings.tingwu_enabled ?? true
+    tingwuConfigPath.value = settings.tingwu_config_path || 'tingwu/config.json'
+    tingwuPollIntervalSec.value = settings.tingwu_poll_interval_sec || 10
+    tingwuTimeoutSec.value = settings.tingwu_timeout_sec || 14400
+    tingwuFallbackToWhisper.value = settings.tingwu_fallback_to_whisper ?? false
     transcriptionDevice.value = settings.device || 'cpu'
     transcriptionModelSource.value = settings.model_source || 'auto_download'
     transcriptionModelSize.value = settings.model_size || 'tiny'
     transcriptionModelPathInput.value = settings.model_path || ''
     enableBilibiliSubtitleFetch.value = settings.enable_bilibili_subtitle_fetch ?? true
-    enableAsrTranscription.value = settings.enable_asr_transcription ?? false
   }
 }, { immediate: true })
+
+watch(() => props.tingwuAuthCheckResult, (result) => {
+  if (result?.valid && result.updated) {
+    tingwuSessionInput.value = ''
+  }
+})
 
 watch(() => props.summarizationSettings, (settings) => {
   if (settings) {
@@ -143,28 +239,26 @@ watch(() => props.summarizationSettings, (settings) => {
     boundaryJumpSec.value = settings.boundary_jump_sec
     autoChunkMinAudioDurationSec.value = secondsToMinutes(settings.auto_chunk_min_audio_duration_sec)
     autoChunkMinTranscriptLines.value = settings.auto_chunk_min_transcript_lines
+    autoChunkMinPlainTextChars.value = settings.auto_chunk_min_plain_text_chars
+    summaryDetailLevel.value = settings.summary_detail_level
     maxAgentValueChars.value = settings.max_agent_value_chars
     fallbackToStandardOnAgentError.value = settings.fallback_to_standard_on_agent_error
   }
 }, { immediate: true })
 
-const handleProviderPresetChange = () => {
-  const provider = props.llmProviders.find(p => p.id === llmProvider.value)
-  if (provider) {
-    llmBaseUrl.value = provider.default_base_url || ''
-    llmModelId.value = provider.default_model_id || ''
-  }
-}
-
 const handleSaveLlmSettings = () => {
   const payload: {
-    provider: string
+    profile_id: string
+    name?: string
+    provider?: string
     base_url?: string
     api_key?: string
     model_id?: string
     temperature?: number
   } = {
-    provider: llmProvider.value,
+    profile_id: props.editingProfileId,
+    name: llmProfileName.value.trim(),
+    provider: props.profileFormState.provider,
     base_url: llmBaseUrl.value.trim(),
     model_id: llmModelId.value.trim(),
     temperature: llmTemperature.value,
@@ -179,15 +273,18 @@ const handleSaveLlmSettings = () => {
 }
 
 const handleTestLlm = () => {
-  // 构建配置 payload
   const payload: {
-    provider: string
+    profile_id: string
+    name?: string
+    provider?: string
     base_url?: string
     api_key?: string
     model_id?: string
     temperature?: number
   } = {
-    provider: llmProvider.value,
+    profile_id: props.editingProfileId,
+    name: llmProfileName.value.trim(),
+    provider: props.profileFormState.provider,
     base_url: llmBaseUrl.value.trim(),
     model_id: llmModelId.value.trim(),
     temperature: llmTemperature.value,
@@ -197,29 +294,34 @@ const handleTestLlm = () => {
     payload.api_key = llmApiKey.value.trim()
   }
 
-  // 触发保存并测试
   emit('updateLlmSettingsAndTest', payload)
-
-  // 清空 API Key 输入框
   llmApiKey.value = ''
 }
 
 const handleSaveTranscriptionSettings = () => {
   const payload: {
+    tingwu_enabled?: boolean
+    tingwu_config_path?: string
+    tingwu_poll_interval_sec?: number
+    tingwu_timeout_sec?: number
+    tingwu_fallback_to_whisper?: boolean
     device?: 'cpu' | 'cuda'
     model_source?: 'auto_download' | 'manual_path'
     model_size?: 'tiny' | 'base' | 'small' | 'medium' | 'large'
     model_path?: string
     enable_bilibili_subtitle_fetch?: boolean
-    enable_asr_transcription?: boolean
     bilibili_sessdata?: string
   } = {
+    tingwu_enabled: tingwuEnabled.value,
+    tingwu_config_path: tingwuConfigPath.value.trim(),
+    tingwu_poll_interval_sec: Math.max(1, Number(tingwuPollIntervalSec.value || 10)),
+    tingwu_timeout_sec: Math.max(60, Number(tingwuTimeoutSec.value || 14400)),
+    tingwu_fallback_to_whisper: tingwuFallbackToWhisper.value,
     device: transcriptionDevice.value,
     model_source: transcriptionModelSource.value,
     model_size: transcriptionModelSize.value,
     model_path: transcriptionModelPathInput.value.trim(),
-    enable_bilibili_subtitle_fetch: enableBilibiliSubtitleFetch.value,
-    enable_asr_transcription: enableAsrTranscription.value,
+    enable_bilibili_subtitle_fetch: enableBilibiliSubtitleFetch.value
   }
 
   const cookie = globalBilibiliSessdataInput.value.trim()
@@ -247,6 +349,8 @@ const handleSaveSummarizationSettings = () => {
     boundary_jump_sec: boundaryJumpSec.value,
     auto_chunk_min_audio_duration_sec: minutesToSeconds(autoChunkMinAudioDurationSec.value),
     auto_chunk_min_transcript_lines: autoChunkMinTranscriptLines.value,
+    auto_chunk_min_plain_text_chars: Math.max(1000, Number(autoChunkMinPlainTextChars.value || 0)),
+    summary_detail_level: Math.min(5, Math.max(1, Number(summaryDetailLevel.value || 5))),
     max_agent_value_chars: Math.max(100, Number(maxAgentValueChars.value || 0)),
     fallback_to_standard_on_agent_error: fallbackToStandardOnAgentError.value,
   })
@@ -325,29 +429,125 @@ const handleSaveSummarizationSettings = () => {
           <div class="flex-1 overflow-y-auto px-4 md:px-6 py-4 md:py-6 custom-scrollbar min-h-0">
             <!-- LLM 设置 -->
             <div v-if="settingsTab === 'llm'" class="space-y-4">
-              <!-- 基础配置 -->
-              <div class="rounded-xl border border-slate-200 bg-white p-4 space-y-4">
+              <!-- 配置列表 -->
+              <div class="rounded-xl border border-slate-200 bg-white p-4 space-y-3">
+                <div class="flex items-center justify-between pb-2 border-b border-slate-100">
+                  <div class="flex items-center gap-2">
+                    <PhCpu :size="18" class="text-blue-500" />
+                    <h3 class="text-sm font-semibold text-slate-800">配置列表</h3>
+                  </div>
+                  <button
+                    @click="openCreateProfileDialog"
+                    class="flex items-center gap-1 px-2 py-1 text-xs font-medium text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"
+                  >
+                    <PhPlus :size="14" />
+                    <span>新建</span>
+                  </button>
+                </div>
+                <div class="space-y-2">
+                  <button
+                    v-for="profile in llmSettings?.profiles || []"
+                    :key="profile.id"
+                    @click="handleSelectProfile(profile.id)"
+                    :class="[
+                      'flex items-center justify-between gap-2 w-full px-3 py-2.5 rounded-lg border text-left transition-all',
+                      activeProfileId === profile.id
+                        ? 'border-blue-500 bg-blue-50'
+                        : editingProfileId === profile.id
+                          ? 'border-slate-300 bg-slate-50'
+                          : 'border-slate-200 bg-white hover:border-slate-300'
+                    ]"
+                  >
+                    <div class="flex items-center gap-2 min-w-0">
+                      <component :is="providerIcon(profile.provider)" :size="16" :weight="activeProfileId === profile.id ? 'fill' : 'regular'" :class="activeProfileId === profile.id ? 'text-blue-600' : 'text-slate-500'" />
+                      <span class="text-sm font-medium truncate" :class="activeProfileId === profile.id ? 'text-blue-700' : 'text-slate-700'">{{ profile.name }}</span>
+                      <span v-if="profile.has_api_key" class="shrink-0">
+                        <PhCheckCircle :size="12" class="text-emerald-500" weight="fill" />
+                      </span>
+                      <span v-if="activeProfileId === profile.id" class="shrink-0 text-xs px-1.5 py-0.5 rounded bg-blue-100 text-blue-600 font-medium">活跃</span>
+                    </div>
+                    <button
+                      v-if="(llmSettings?.profiles?.length || 0) > 1"
+                      @click.stop="handleDeleteProfile(profile.id)"
+                      class="shrink-0 p-1 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded transition-colors"
+                    >
+                      <PhTrash :size="14" />
+                    </button>
+                  </button>
+                </div>
+
+                <!-- 创建配置对话框 -->
+                <div v-if="isCreatingProfile" class="mt-3 p-3 rounded-lg border border-blue-200 bg-blue-50 space-y-3">
+                  <p class="text-sm font-medium text-blue-700">新建配置</p>
+                  <div>
+                    <label class="block text-xs font-medium text-slate-700 mb-1">配置名称</label>
+                    <input
+                      v-model="newProfileName"
+                      type="text"
+                      placeholder="例如：中转站-GPT4o"
+                      class="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                    >
+                  </div>
+                  <div>
+                    <label class="block text-xs font-medium text-slate-700 mb-1">供应商类型</label>
+                    <div class="grid grid-cols-2 gap-2">
+                      <button
+                        v-for="provider in llmProviders"
+                        :key="provider.id"
+                        @click="newProfileProvider = provider.id"
+                        :class="[
+                          'flex items-center gap-1.5 px-2 py-1.5 rounded-lg border text-xs transition-all',
+                          newProfileProvider === provider.id
+                            ? 'border-blue-500 bg-blue-50 text-blue-700'
+                            : 'border-slate-200 bg-white text-slate-600 hover:border-slate-300'
+                        ]"
+                      >
+                        <component :is="providerIcon(provider.id)" :size="14" />
+                        <span>{{ provider.label }}</span>
+                      </button>
+                    </div>
+                  </div>
+                  <div class="flex gap-2">
+                    <button
+                      @click="handleCreateProfile"
+                      :disabled="!newProfileName.trim()"
+                      class="px-3 py-1.5 bg-blue-500 text-white rounded-lg text-xs font-medium disabled:opacity-50 disabled:cursor-not-allowed hover:bg-blue-600 transition-colors"
+                    >创建</button>
+                    <button
+                      @click="isCreatingProfile = false"
+                      class="px-3 py-1.5 bg-slate-100 text-slate-600 rounded-lg text-xs font-medium hover:bg-slate-200 transition-colors"
+                    >取消</button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- 配置编辑 -->
+              <div v-if="editingProfile" class="rounded-xl border border-slate-200 bg-white p-4 space-y-4">
                 <div class="flex items-center gap-2 pb-2 border-b border-slate-100">
-                  <PhBrain :size="18" class="text-blue-500" />
-                  <h3 class="text-sm font-semibold text-slate-800">基础配置</h3>
+                  <component :is="providerIcon(editingProfile.provider)" :size="18" class="text-blue-500" />
+                  <h3 class="text-sm font-semibold text-slate-800">{{ llmProfileName || editingProfile.name }} 配置</h3>
                 </div>
 
                 <div>
-                  <label class="block text-xs font-medium text-slate-700 mb-2">LLM 供应商</label>
-                  <div class="relative">
-                    <PhCpu :size="16" class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
-                    <select
-                      v-model="llmProvider"
-                      :disabled="isTestingLlm || isUpdatingLlmSettings"
-                      class="w-full pl-9 pr-3 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                      @change="handleProviderPresetChange"
-                    >
-                      <option value="" disabled>选择 LLM 供应商</option>
-                      <option v-for="provider in llmProviders" :key="provider.id" :value="provider.id">
-                        {{ provider.label }}
-                      </option>
-                    </select>
-                  </div>
+                  <label class="block text-xs font-medium text-slate-700 mb-2">配置名称</label>
+                  <input
+                    v-model="llmProfileName"
+                    type="text"
+                    placeholder="配置名称"
+                    :disabled="isTestingLlm || isUpdatingLlmSettings || isSwitchingProfile"
+                    class="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                </div>
+
+                <div>
+                  <label class="block text-xs font-medium text-slate-700 mb-2">供应商类型</label>
+                  <select
+                    v-model="props.profileFormState.provider"
+                    :disabled="isTestingLlm || isUpdatingLlmSettings || isSwitchingProfile"
+                    class="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  >
+                    <option v-for="provider in llmProviders" :key="provider.id" :value="provider.id">{{ provider.label }}</option>
+                  </select>
                 </div>
 
                 <div>
@@ -356,7 +556,7 @@ const handleSaveSummarizationSettings = () => {
                     v-model="llmBaseUrl"
                     type="text"
                     placeholder="https://api.example.com/v1"
-                    :disabled="isTestingLlm || isUpdatingLlmSettings"
+                    :disabled="isTestingLlm || isUpdatingLlmSettings || isSwitchingProfile"
                     class="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                   >
                 </div>
@@ -366,8 +566,8 @@ const handleSaveSummarizationSettings = () => {
                   <input
                     v-model="llmModelId"
                     type="text"
-                    placeholder="example-model-id"
-                    :disabled="isTestingLlm || isUpdatingLlmSettings"
+                    placeholder="model-id"
+                    :disabled="isTestingLlm || isUpdatingLlmSettings || isSwitchingProfile"
                     class="w-full px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                   >
                 </div>
@@ -380,18 +580,10 @@ const handleSaveSummarizationSettings = () => {
                     min="0"
                     max="2"
                     step="0.1"
-                    :disabled="isTestingLlm || isUpdatingLlmSettings"
+                    :disabled="isTestingLlm || isUpdatingLlmSettings || isSwitchingProfile"
                     class="w-full h-2 bg-slate-200 rounded-lg appearance-none cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                   <p class="text-xs text-slate-500 mt-1">控制输出的随机性，0 = 确定性，2 = 最随机</p>
-                </div>
-              </div>
-
-              <!-- API 密钥 -->
-              <div class="rounded-xl border border-slate-200 bg-white p-4 space-y-4">
-                <div class="flex items-center gap-2 pb-2 border-b border-slate-100">
-                  <PhKey :size="18" class="text-blue-500" />
-                  <h3 class="text-sm font-semibold text-slate-800">API 密钥</h3>
                 </div>
 
                 <div>
@@ -401,22 +593,22 @@ const handleSaveSummarizationSettings = () => {
                     <input
                       v-model="llmApiKey"
                       type="password"
-                      placeholder="sk-..."
-                      :disabled="isTestingLlm || isUpdatingLlmSettings"
+                      placeholder="留空则保持当前密钥"
+                      :disabled="isTestingLlm || isUpdatingLlmSettings || isSwitchingProfile"
                       class="w-full pl-9 pr-3 py-2.5 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                     >
                   </div>
-                  <p v-if="llmSettings?.has_api_key" class="text-xs text-emerald-600 mt-2">
-                    ✓ 已配置 API Key ({{ llmSettings.api_key_hint }})
+                  <p v-if="editingProfile?.has_api_key" class="text-xs text-emerald-600 mt-2">
+                    ✓ 已配置 API Key ({{ editingProfile?.api_key_hint }})
                   </p>
                 </div>
               </div>
 
               <!-- 操作按钮 -->
-              <div class="flex gap-3">
+              <div v-if="editingProfile" class="flex gap-3">
                 <button
                   @click="handleSaveLlmSettings"
-                  :disabled="isTestingLlm || isUpdatingLlmSettings"
+                  :disabled="isTestingLlm || isUpdatingLlmSettings || isSwitchingProfile"
                   class="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-blue-500 hover:bg-blue-600 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <PhSpinner v-if="isUpdatingLlmSettings" :size="16" class="animate-spin" />
@@ -424,7 +616,7 @@ const handleSaveSummarizationSettings = () => {
                 </button>
                 <button
                   @click="handleTestLlm"
-                  :disabled="isTestingLlm || isUpdatingLlmSettings"
+                  :disabled="isTestingLlm || isUpdatingLlmSettings || isSwitchingProfile"
                   class="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-emerald-500 hover:bg-emerald-600 text-white rounded-lg text-sm font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   <PhFlask :size="16" />
@@ -435,8 +627,142 @@ const handleSaveSummarizationSettings = () => {
 
           <!-- 转录设置 -->
           <div v-if="settingsTab === 'transcription'" class="space-y-4">
+            <!-- 通义听悟 -->
+            <div class="rounded-xl border border-blue-200 bg-blue-50/40 p-4 space-y-4">
+              <div class="flex items-center justify-between gap-3 pb-2 border-b border-blue-100">
+                <div>
+                  <h3 class="text-sm font-semibold text-slate-800">通义听悟转录</h3>
+                  <p class="mt-0.5 text-xs text-slate-500">默认使用云端听悟，本地 Whisper 仅在主动启用回退时加载。</p>
+                </div>
+                <button
+                  @click="tingwuEnabled = !tingwuEnabled"
+                  :class="[
+                    'relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2',
+                    tingwuEnabled ? 'bg-blue-500' : 'bg-slate-300'
+                  ]"
+                  role="switch"
+                  :aria-checked="tingwuEnabled"
+                >
+                  <span
+                    :class="[
+                      'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow transition',
+                      tingwuEnabled ? 'translate-x-5' : 'translate-x-0'
+                    ]"
+                  ></span>
+                </button>
+              </div>
+
+              <div>
+                <label class="block text-xs text-slate-600 mb-1.5">认证配置文件</label>
+                <input
+                  v-model="tingwuConfigPath"
+                  type="text"
+                  placeholder="tingwu/config.json"
+                  class="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                >
+                <p class="mt-1 text-xs" :class="transcriptionSettings?.tingwu_configured ? 'text-emerald-700' : 'text-amber-700'">
+                  {{ transcriptionSettings?.tingwu_configured ? '配置文件存在且权限符合要求' : '请确认配置文件存在，并将权限设为仅当前用户可读写' }}
+                </p>
+              </div>
+
+              <div class="grid grid-cols-2 gap-3">
+                <label class="space-y-1.5">
+                  <span class="text-xs text-slate-600">轮询间隔（秒）</span>
+                  <input
+                    v-model.number="tingwuPollIntervalSec"
+                    type="number"
+                    min="1"
+                    step="1"
+                    class="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                  >
+                </label>
+                <label class="space-y-1.5">
+                  <span class="text-xs text-slate-600">任务超时（秒）</span>
+                  <input
+                    v-model.number="tingwuTimeoutSec"
+                    type="number"
+                    min="60"
+                    step="60"
+                    class="w-full px-3 py-2.5 bg-white border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                  >
+                </label>
+              </div>
+
+              <div class="flex items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-4 py-3">
+                <div>
+                  <p class="text-sm font-medium text-slate-700">失败时回退本地 Whisper</p>
+                  <p class="mt-0.5 text-xs text-slate-500">默认关闭，关闭时不会为听悟任务加载本地语音模型。</p>
+                </div>
+                <button
+                  @click="tingwuFallbackToWhisper = !tingwuFallbackToWhisper"
+                  :class="[
+                    'relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2',
+                    tingwuFallbackToWhisper ? 'bg-blue-500' : 'bg-slate-300'
+                  ]"
+                  role="switch"
+                  :aria-checked="tingwuFallbackToWhisper"
+                >
+                  <span
+                    :class="[
+                      'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow transition',
+                      tingwuFallbackToWhisper ? 'translate-x-5' : 'translate-x-0'
+                    ]"
+                  ></span>
+                </button>
+              </div>
+
+              <div class="rounded-xl border border-slate-200 bg-white px-4 py-3 space-y-2.5">
+                <label class="block text-sm font-medium text-slate-700">更新听悟 Session</label>
+                <p class="text-xs text-slate-500">粘贴浏览器请求中的完整 Cookie/Session；保存时会立即验证，验证失败会保留原值。</p>
+                <div class="flex gap-2">
+                  <input
+                    v-model="tingwuSessionInput"
+                    type="password"
+                    autocomplete="off"
+                    placeholder="粘贴完整听悟 Session"
+                    class="min-w-0 flex-1 px-3 py-2.5 bg-slate-50 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                  >
+                  <button
+                    @click="emit('updateTingwuSession', tingwuSessionInput.trim())"
+                    :disabled="isUpdatingTingwuSession || !tingwuSessionInput.trim()"
+                    class="shrink-0 inline-flex items-center gap-2 rounded-xl bg-blue-500 px-3 py-2 text-xs font-medium text-white hover:bg-blue-600 disabled:opacity-50"
+                  >
+                    <PhSpinner v-if="isUpdatingTingwuSession" :size="14" class="animate-spin" />
+                    {{ isUpdatingTingwuSession ? '更新并验证中...' : '更新并验证' }}
+                  </button>
+                </div>
+              </div>
+
+              <div class="flex items-center justify-between gap-3">
+                <p
+                  v-if="tingwuAuthCheckResult"
+                  class="text-xs"
+                  :class="tingwuAuthCheckResult.valid ? 'text-emerald-700' : 'text-amber-700'"
+                >
+                  {{ tingwuAuthCheckResult.message }}
+                </p>
+                <span v-else class="text-xs text-slate-500">可直接验证当前已保存的听悟会话。</span>
+                <button
+                  @click="emit('checkTingwuAuth')"
+                  :disabled="isCheckingTingwuAuth"
+                  class="shrink-0 inline-flex items-center gap-2 rounded-lg border border-blue-200 bg-white px-3 py-2 text-xs font-medium text-blue-700 hover:bg-blue-50 disabled:opacity-50"
+                >
+                  <PhSpinner v-if="isCheckingTingwuAuth" :size="14" class="animate-spin" />
+                  <PhCheckCircle v-else :size="14" />
+                  {{ isCheckingTingwuAuth ? '验证中...' : '验证认证' }}
+                </button>
+              </div>
+            </div>
+
+            <div
+              v-if="tingwuEnabled && !tingwuFallbackToWhisper"
+              class="rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-xs text-emerald-700"
+            >
+              当前只使用 Tingwu；本地 Whisper 模型与 CPU/CUDA 设置不会被加载。
+            </div>
+
             <!-- 硬件配置 -->
-            <div class="rounded-xl border border-slate-200 bg-white p-4 space-y-4">
+            <div v-if="!tingwuEnabled || tingwuFallbackToWhisper" class="rounded-xl border border-slate-200 bg-white p-4 space-y-4">
               <div class="flex items-center gap-2 pb-2 border-b border-slate-100">
                 <PhCpu :size="18" class="text-blue-500" />
                 <h3 class="text-sm font-semibold text-slate-800">硬件配置</h3>
@@ -494,7 +820,7 @@ const handleSaveSummarizationSettings = () => {
             </div>
 
             <!-- 模型配置 -->
-            <div class="rounded-xl border border-slate-200 bg-white p-4 space-y-4">
+            <div v-if="!tingwuEnabled || tingwuFallbackToWhisper" class="rounded-xl border border-slate-200 bg-white p-4 space-y-4">
               <div class="flex items-center gap-2 pb-2 border-b border-slate-100">
                 <PhMicrophone :size="18" class="text-blue-500" />
                 <h3 class="text-sm font-semibold text-slate-800">模型配置</h3>
@@ -586,7 +912,7 @@ const handleSaveSummarizationSettings = () => {
               <div class="flex-1 min-w-0">
                 <p class="text-sm font-medium text-slate-700">优先使用 B 站字幕</p>
                 <p class="text-xs text-slate-500 mt-0.5">
-                  仅对 B 站链接生效；默认不回退 ASR
+                  仅对 B 站链接生效；未获取到字幕时自动回退到下载+ASR
                 </p>
               </div>
               <button
@@ -602,31 +928,6 @@ const handleSaveSummarizationSettings = () => {
                   :class="[
                     'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
                     enableBilibiliSubtitleFetch ? 'translate-x-5' : 'translate-x-0'
-                  ]"
-                ></span>
-              </button>
-            </div>
-
-            <div class="flex items-center justify-between gap-3 px-4 py-3 rounded-xl border border-slate-200 bg-slate-50">
-              <div class="flex-1 min-w-0">
-                <p class="text-sm font-medium text-slate-700">允许模型语音识别（ASR）</p>
-                <p class="text-xs text-slate-500 mt-0.5">
-                  关闭时不会加载/使用语音识别模型；只能依赖字幕来源。
-                </p>
-              </div>
-              <button
-                @click="enableAsrTranscription = !enableAsrTranscription"
-                :class="[
-                  'relative inline-flex h-6 w-11 shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2',
-                  enableAsrTranscription ? 'bg-blue-500' : 'bg-slate-300'
-                ]"
-                role="switch"
-                :aria-checked="enableAsrTranscription"
-              >
-                <span
-                  :class="[
-                    'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
-                    enableAsrTranscription ? 'translate-x-5' : 'translate-x-0'
                   ]"
                 ></span>
               </button>
@@ -769,6 +1070,16 @@ const handleSaveSummarizationSettings = () => {
                     class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
                   >
                 </div>
+                <div>
+                  <label class="block text-xs text-slate-600 mb-1.5">纯文本字符达到</label>
+                  <input
+                    v-model.number="autoChunkMinPlainTextChars"
+                    type="number"
+                    min="1000"
+                    step="500"
+                    class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                  >
+                </div>
               </div>
             </div>
 
@@ -800,12 +1111,23 @@ const handleSaveSummarizationSettings = () => {
                     class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
                   >
                 </div>
+                <div>
+                  <label class="block text-xs text-slate-600 mb-1.5">总结详细度(1-5)</label>
+                  <input
+                    v-model.number="summaryDetailLevel"
+                    type="number"
+                    min="1"
+                    max="5"
+                    step="1"
+                    class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                  >
+                </div>
               </div>
 
               <!-- 错误回退开关 -->
               <div class="flex items-center justify-between gap-3 pt-2">
                 <div class="flex-1 min-w-0">
-                  <p class="text-xs font-medium text-slate-700">Agent 失败自动回退标准模式</p>
+                  <p class="text-xs font-medium text-slate-700">Agent 失败自动回退通用模式</p>
                   <p class="text-xs text-slate-500 mt-0.5">
                     开启后遇到分块异常会自动降级，保证任务尽量产出结果。
                   </p>

@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="#快速部署"><img src="https://img.shields.io/badge/Version-v0.1.0-orange.svg?style=for-the-badge" alt="Version v0.1.0"></a>
+  <a href="#快速部署"><img src="https://img.shields.io/badge/Version-v0.1.2-orange.svg?style=for-the-badge" alt="Version v0.1.2"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL%20v3-blue.svg?style=for-the-badge" alt="GPL v3 License"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/Python-3.10+-blue.svg?style=for-the-badge" alt="Python 3.10+"></a>
   <a href="https://vuejs.org/"><img src="https://img.shields.io/badge/Vue-3.x-green.svg?style=for-the-badge" alt="Vue 3"></a>
@@ -68,7 +68,7 @@
 
 采用创新的上下文管理技术，让 AI 在处理长视频时既保持结构一致性，又能保留关键细节。
 
-**标准模式**：
+**通用模式**：
 - 基于精心调试的提示词与总结流程
 - 适合绝大多数视频场景（建议40分钟-1小时以内）
 - 在信息密度、可读性和结构化表达之间做平衡
@@ -84,7 +84,7 @@
   - 测试视频：[《如何像高级工程师一样设计API？REST、GraphQL、认证与安全核心要点》(时长01:23:21)](https://www.bilibili.com/video/BV16wZKBbEbd)
   - **Agent增强模式**：细节更丰富，更像是一篇详实的完整文章
 - ⚙️ **使用方式**：
-  - 在前端页面"开始处理"按钮上方，通过滑块切换标准/Agent模式
+  - 在前端页面"开始处理"按钮上方，通过按钮切换通用/Agent 模式
   - 也可在前端设置中选择自动模式（按视频长度自动选择总结策略）
 
 ### **2. 丰富输出 📊**
@@ -127,8 +127,16 @@
 - 进度条实时显示任务状态
 - 任务元数据、视频链接可追溯
 - 支持任务处理流水线（下载 → 转录 → 摘要）
+- **文件管理系统**：嵌套文件夹组织、拖拽移动、B站多P视频自动建文件夹
 
-### **5. 音视频支持 🎬**
+### **5. Profile 配置系统 ⚙️**
+
+- 支持创建多个独立的 LLM 配置（Profile），每个配置有名称、供应商、模型等
+- 一键切换活跃配置，无需重新输入 API Key
+- 内置 OpenAI / DeepSeek / OpenRouter / Ollama 等供应商预设，自动填入默认值
+- 同一中转站可创建多个 Profile 分别对应不同模型
+
+### **6. 音视频支持 🎬**
 
 - **Bilibili直链转换**：支持B站视频一键下载
 - **本地文件上传**：支持本地音频/视频文件
@@ -138,12 +146,15 @@
 - 视频：`.mp4`、`.avi`、`.mov`、`.mkv`、`.flv`、`.wmv`、`.webm`、`.m4v`
 - 音频：`.mp3`、`.wav`、`.flac`、`.aac`、`.ogg`、`.m4a`、`.wma`、`.opus`
 
-#### **5. CPU 友好 + GPU 加速 ⚡**
-默认即开即用的 `CPU` 转录体验，同时提供可切换的 `CUDA` 加速路径：
+#### **6. 字幕优先 + Tingwu 转录 ⚡**
+默认流水线为“已有字幕 → 通义听悟 → 可选本地 Whisper 回退”，转录后自动进入所选总结模式：
 
-- **CPU 开箱可用**：默认 `tiny + CPU`，在 i7-12700 上实测约 `10x` 识别倍率（具体耗时与音频质量、模型大小有关）
+- **B 站字幕优先**：能取得字幕时直接复用，跳过语音识别
+- **Tingwu 默认启用**：无字幕或上传本地媒体时使用听悟，不加载本地 Whisper 模型
+- **Session 自动检查**：页面启动时验证有效性，也可在转录设置中更新并立即验证 Session
+- **字幕产物**：听悟结果保存为 TXT/SRT，并可在任务原文页下载 SRT
+- **本地回退可选**：听悟失败后是否加载本地 Whisper 由设置控制，默认关闭
 - **CUDA 智能诊断**：自动检测 `NVIDIA / PyTorch CUDA / CTranslate2` 状态；可用时启用 GPU 转录，不可用时给出原因与处理建议
-- **字幕优先，回退语音识别**：可开启”优先使用字幕”，未获取到字幕时自动回退到本地语音识别
 
 <p align="center">
   <img src="prj-docs/images/subtitle.png" alt="转录设置" width="600">
@@ -174,7 +185,7 @@
 - 相比起 CPU ，转录速度可提升 3-10 倍（取决于显卡性能）
 - 推荐显存：4GB以上（tiny/base模型），8GB以上（medium/large模型）
 
-#### **6. PC / 手机端Web阅读支持 📱**
+#### **7. PC / 手机端Web阅读支持 📱**
 宽屏/窄屏自适应布局，良好阅读体验
 
 
@@ -345,7 +356,7 @@ python ShengWen-app.py
 INFO  2026-03-13 10:13:01.248 Using SQLite database: ShengWen.db
 INFO  2026-03-13 10:13:03.422 --- [Startup] 未检测到代理环境，已自动接管本地代理端口 7890 ---
 INFO  2026-03-13 10:13:03.429 ╔════════════════════════════════════════════════════════════╗
-INFO  2026-03-13 10:13:03.429 ║  声文智汇 ShengWen v0.1.0                           ║
+INFO  2026-03-13 10:13:03.429 ║  声文智汇 ShengWen v0.1.2                           ║
 INFO  2026-03-13 10:13:03.429 ╚════════════════════════════════════════════════════════════╝
 INFO:     Started server process [22792]
 INFO:     Waiting for application startup.
@@ -389,16 +400,32 @@ ShengWen 当前版本以 **前端设置面板** 作为主要配置入口，同�
     "enable_bilibili_subtitle_fetch": true,
     "bilibili_sessdata": ""
   },
+  "tingwu": {
+    "enabled": true,
+    "config_path": "tingwu/config.json",
+    "poll_interval_sec": 10,
+    "timeout_sec": 14400,
+    "fallback_to_whisper": false
+  },
   "llm": {
-    "provider": "openai_compatible",
-    "base_url": "https://your-llm-endpoint/v1",
-    "api_key": "your_api_key",
-    "model_id": "your_model_id",
-    "temperature": 0.7,
-    "context_window_size": 1000000
+    "profiles": [
+      {
+        "id": "default",
+        "name": "DeepSeek V4",
+        "provider": "deepseek",
+        "base_url": "https://api.deepseek.com",
+        "api_key": "your_api_key",
+        "model_id": "deepseek-v4-flash",
+        "temperature": 0.7,
+        "context_window_size": 1000000
+      }
+    ],
+    "active_profile_id": "default"
   }
 }
 ```
+
+听悟认证配置可从 `tingwu/config.example.json` 创建；实际的 `tingwu/config.json` 仅保存在本机，Unix 系统需执行 `chmod 600 tingwu/config.json`。前端只接收新的 Session 并返回验证状态，不回显已保存值。
 
 ### B 站字幕直取与 Cookie 来源
 
@@ -414,9 +441,9 @@ ShengWen 当前版本以 **前端设置面板** 作为主要配置入口，同�
 
 **刚部署下来不会用？先看**：[使用说明](prj-docs/使用说明.md)
 
-### Q1. 怎么用转录模型？
+### Q1. 怎么配置本地 Whisper 回退？
 
-首次启动时，转录模型会自动联网下载；网络不通时任务可能无法正常开始。也可先准备好本地模型，再让 ShengWen 直接读取本地文件夹。
+默认使用 Tingwu，本地 Whisper 只在关闭 Tingwu 或开启“失败时回退本地 Whisper”后加载。启用回退时可自动下载模型，也可先准备好本地模型目录。
 
 | 模型档位 | 速度/资源占用 | 质量与适用场景 | 官方下载页 |
 | :--- | :--- | :--- | :--- |
@@ -469,8 +496,8 @@ ShengWen 当前版本以 **前端设置面板** 作为主要配置入口，同�
 | 大语言 AI 模型 | 总结风格（实测） |  总结效果示例<br>（总结至 [@林亦LYi](https://space.bilibili.com/4401694/?spm_id_from=333.788.upinfo.detail.click) 的 [一个视频搞懂OpenClaw！](https://www.bilibili.com/video/BV1jEAaz3E6K)） |
 | :--- | :--- | :--- | 
 | **Gemini 2.5/3.0 Pro** | 上下文能力较好 + 带思考，原文细节较为丰富（个人最习惯用） | [点击查看示例图](prj-docs/images/llm-gemini-25pro-summary-20260301-1214.png) |
-| **DeepSeek V3.2** | 输出迅速，结构完整，出现错字概率稍高，可尝试搭配更大的转录模型或抽卡解决 | [点击查看示例图](prj-docs/images/llm-deepseek-v32-summary-20260301-1223.png) |
-| **GPT 5.2** | 细节丰富，有专业感 | [点击查看示例图](prj-docs/images/llm-gpt52-summary-20260301-1213.png) |
+| **DeepSeek V4 Flash** | 输出迅速，性价比极高，长上下文天然适合该项目 | [点击查看示例图](prj-docs/images/llm-deepseek-v4flash-summary.png) |
+| **GPT 4.1 / 5.x** | 细节丰富，有专业感 | [点击查看示例图](prj-docs/images/llm-gpt52-summary-20260301-1213.png) |
 - 不同的模型会对最终总结文章的**风味造成影响**。
 - 可尝试用同一视频分别交给不同 AI 模型总结后横向对比，选择最符合自己口味的模型。
 - **模型风味测试实操**：
@@ -507,7 +534,7 @@ ShengWen 当前版本以 **前端设置面板** 作为主要配置入口，同�
 - [ ] 英文语言支持（界面与提示）
 - [ ] 增加agent模式下流水线处理（一遍转录一遍总结）
 - [ ] 批量任务处理（批量链接、批量本地文件、带分 P 视频链接处理一键批量任务、批量导出总结文本等）
-- [ ] 更好的设置界面引导（如引导下载转录模型、配置LLM等）
+- [x] ~~更好的设置界面引导（Profile 配置系统、供应商预设自动填入）~~（2026-05-04已实现）
 - [ ] 研究如何结合 AI 视觉能力，让总结中包含视频画面信息（如果研究出来了，我是不是可以把这个项目的名字从“**声文智汇**”改成“**声文视汇**”……？🤔）
 
 ---

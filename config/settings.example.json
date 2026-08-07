@@ -5,7 +5,8 @@
     "enable_progress_test": false,
     "enable_mdns": false,
     "frontend_dist_dir": "frontend/dist",
-    "prompt_file": "src/main/python/sheng_wen/prompt.md"
+    "prompt_file": "src/main/python/sheng_wen/prompt.md",
+    "temp_dir": "temp"
   },
   "whisper": {
     "model_source": "auto_download",
@@ -13,17 +14,30 @@
     "model_size": "tiny",
     "device": "cpu",
     "enable_bilibili_subtitle_fetch": true,
-    "enable_asr_transcription": false,
     "bilibili_sessdata": "",
     "faster_whisper_model_path": null
   },
+  "tingwu": {
+    "enabled": true,
+    "config_path": "tingwu/config.json",
+    "poll_interval_sec": 10.0,
+    "timeout_sec": 14400.0,
+    "fallback_to_whisper": false
+  },
   "llm": {
-    "provider": "openai_compatible",
-    "base_url": "",
-    "api_key": "",
-    "model_id": "",
-    "temperature": 0.7,
-    "context_window_size": 1000000
+    "active_profile_id": "a6c8c4b2",
+    "profiles": [
+      {
+        "id": "a6c8c4b2",
+        "name": "OpenAI 兼容接口",
+        "provider": "openai_compatible",
+        "base_url": "https://api.openai.com/v1",
+        "api_key": "",
+        "model_id": "gpt-4o-mini",
+        "temperature": 0.7,
+        "context_window_size": 1000000
+      }
+    ]
   },
   "database": {
     "sqlite_path": "ShengWen.db",
@@ -36,19 +50,21 @@
     "allow_headers": "*"
   },
   "summarization": {
-    "mode": "auto",
+    "mode": "standard",
     "auto_chunk_min_audio_duration_sec": 2400,
     "auto_chunk_min_transcript_lines": 1800,
-    "chunk_target_duration_sec": 2400,
-    "chunk_min_duration_sec": 1800,
-    "chunk_max_duration_sec": 3000,
+    "auto_chunk_min_plain_text_chars": 6000,
+    "chunk_target_duration_sec": 1200,
+    "chunk_min_duration_sec": 900,
+    "chunk_max_duration_sec": 1500,
     "boundary_jump_sec": 10,
-    "prev_tail_timestamp_lines_m": 10,
-    "prev_summary_tail_chars_j": 500,
+    "prev_tail_timestamp_lines_m": 16,
+    "prev_summary_tail_chars_j": 900,
+    "summary_detail_level": 5,
     "llm_call_retry_max": 3,
     "fallback_to_standard_on_agent_error": true,
     "chunk_prompt_file": "src/main/python/sheng_wen/prompt_for_chunk.md",
-    "max_agent_value_chars": 500,
+    "max_agent_value_chars": 1000,
     "chunk_debug_dump_enabled": false,
     "chunk_debug_dump_dir": "temp/chunk_debug",
     "enable_agent_pipeline": false,

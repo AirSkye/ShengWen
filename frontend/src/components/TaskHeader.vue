@@ -2,6 +2,7 @@
 import { PhMonitorPlay, PhPencilSimple, PhCheck, PhX, PhArrowSquareOut, PhList } from '@phosphor-icons/vue'
 import type { Task } from '../types'
 import { ref, nextTick } from 'vue'
+import { isLinkableSource } from '../utils/formatters'
 
 interface Props {
   task: Task
@@ -69,9 +70,10 @@ const startEditingTopic = () => {
           </button>
         </div>
         <div class="text-[10px] md:text-xs truncate flex items-center gap-1 flex-wrap">
-          <a :href="task.video_url" target="_blank" class="text-primary hover:underline truncate flex items-center gap-1">
+          <a v-if="isLinkableSource(task.video_url)" :href="task.video_url" target="_blank" class="text-primary hover:underline truncate flex items-center gap-1">
             {{ task.video_url }} <PhArrowSquareOut :size="12" />
           </a>
+          <span v-else class="text-slate-500 truncate">{{ task.video_url }}</span>
           <template v-if="task.author_name">
             <span class="text-slate-400">By</span>
             <a

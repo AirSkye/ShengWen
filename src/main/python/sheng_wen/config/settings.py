@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import copy
 import json
-from dataclasses import MISSING, dataclass, fields as dataclass_fields
+import uuid
+from dataclasses import MISSING, dataclass, field, fields as dataclass_fields
 from pathlib import Path
 from threading import Lock
 from typing import Any, Literal
@@ -42,10 +43,12 @@ class AppConfig:
     enable_mdns: bool = False
     frontend_dist_dir: str = "frontend/dist"
     prompt_file: str = "src/main/python/sheng_wen/prompt.md"
+    temp_dir: str = "temp"
 
     def __post_init__(self):
         self.frontend_dist_dir = _resolve_project_path(self.frontend_dist_dir)
         self.prompt_file = _resolve_project_path(self.prompt_file)
+        self.temp_dir = _resolve_project_path(self.temp_dir)
 
 
 @dataclass
@@ -55,7 +58,6 @@ class WhisperConfig:
     model_size: Literal["tiny", "base", "small", "medium", "large"] = "tiny"
     device: Literal["cpu", "cuda"] = "cpu"
     enable_bilibili_subtitle_fetch: bool = True
-    enable_asr_transcription: bool = False
     bilibili_sessdata: str = ""
     faster_whisper_model_path: str | None = None
 
@@ -78,6 +80,39 @@ class WhisperConfig:
 
 
 @dataclass
+class TingwuConfig:
+    enabled: bool = True
+    config_path: str = "tingwu/config.json"
+    poll_interval_sec: float = 10.0
+    timeout_sec: float = 14400.0
+    fallback_to_whisper: bool = False
+
+    def __post_init__(self):
+        self.config_path = _resolve_project_path(self.config_path)
+        self.poll_interval_sec = max(1.0, float(self.poll_interval_sec))
+        self.timeout_sec = max(60.0, float(self.timeout_sec))
+
+
+@dataclass
+class LLMProfileConfig:
+    id: str = ""
+    name: str = ""
+    provider: str = "openai_compatible"
+    base_url: str = ""
+    api_key: str = ""
+    model_id: str = ""
+    temperature: float = 0.7
+    context_window_size: int = 1000000
+
+
+@dataclass
+class LLMProfilesConfig:
+    active_profile_id: str = ""
+    profiles: list[LLMProfileConfig] = field(default_factory=list)
+
+
+# Backward-compatible single-provider config (used by llm.py)
+@dataclass
 class LLMConfig:
     provider: str = "openai_compatible"
     base_url: str = ""
@@ -85,6 +120,40 @@ class LLMConfig:
     model_id: str = ""
     temperature: float = 0.7
     context_window_size: int = 1000000
+
+
+_BUILTIN_PROVIDER_DEFAULTS: dict[str, dict[str, Any]] = {
+    "openai_compatible": {
+        "label": "OpenAI 兼容接口",
+        "base_url": "https://api.openai.com/v1",
+        "api_key": "",
+        "model_id": "gpt-4o-mini",
+    },
+    "openai": {
+        "label": "OpenAI",
+        "base_url": "https://api.openai.com/v1",
+        "api_key": "",
+        "model_id": "gpt-4.1-mini",
+    },
+    "openrouter": {
+        "label": "OpenRouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "",
+        "model_id": "openai/gpt-4.1-mini",
+    },
+    "ollama": {
+        "label": "Ollama (本地)",
+        "base_url": "http://localhost:11434/v1",
+        "api_key": "",
+        "model_id": "qwen3:14b",
+    },
+    "deepseek": {
+        "label": "DeepSeek",
+        "base_url": "https://api.deepseek.com",
+        "api_key": "",
+        "model_id": "deepseek-v4-flash",
+    },
+}
 
 
 @dataclass
@@ -121,38 +190,42 @@ class CORSConfig:
 
 @dataclass
 class SummarizationConfig:
-    mode: Literal["auto", "standard", "agent"] = "auto"
+    mode: Literal["auto", "standard", "agent"] = "standard"
     auto_chunk_min_audio_duration_sec: int = 2400
     auto_chunk_min_transcript_lines: int = 1800
-    chunk_target_duration_sec: int = 2400
-    chunk_min_duration_sec: int = 1800
-    chunk_max_duration_sec: int = 3000
+    auto_chunk_min_plain_text_chars: int = 6000
+    chunk_target_duration_sec: int = 1200
+    chunk_min_duration_sec: int = 900
+    chunk_max_duration_sec: int = 1500
     boundary_jump_sec: int = 10
-    prev_tail_timestamp_lines_m: int = 10
-    prev_summary_tail_chars_j: int = 500
+    prev_tail_timestamp_lines_m: int = 16
+    prev_summary_tail_chars_j: int = 900
+    summary_detail_level: int = 5
     llm_call_retry_max: int = 3
     fallback_to_standard_on_agent_error: bool = True
     chunk_prompt_file: str = "src/main/python/sheng_wen/prompt_for_chunk.md"
-    max_agent_value_chars: int = 500
+    max_agent_value_chars: int = 1000
     chunk_debug_dump_enabled: bool = False
     chunk_debug_dump_dir: str = "temp/chunk_debug"
     enable_agent_pipeline: bool = False
     transcript_chunk_emit_duration_sec: int = 600
 
     def __post_init__(self):
-        normalized_mode = (self.mode or "auto").lower()
+        normalized_mode = (self.mode or "standard").lower()
         if normalized_mode not in {"auto", "standard", "agent"}:
-            normalized_mode = "auto"
+            normalized_mode = "standard"
         self.mode = normalized_mode  # type: ignore[assignment]
 
         self.auto_chunk_min_audio_duration_sec = max(300, int(self.auto_chunk_min_audio_duration_sec))
         self.auto_chunk_min_transcript_lines = max(100, int(self.auto_chunk_min_transcript_lines))
+        self.auto_chunk_min_plain_text_chars = max(1000, int(self.auto_chunk_min_plain_text_chars))
         self.chunk_target_duration_sec = max(60, int(self.chunk_target_duration_sec))
         self.chunk_min_duration_sec = max(30, int(self.chunk_min_duration_sec))
         self.chunk_max_duration_sec = max(self.chunk_target_duration_sec, int(self.chunk_max_duration_sec))
         self.boundary_jump_sec = max(1, int(self.boundary_jump_sec))
         self.prev_tail_timestamp_lines_m = max(0, int(self.prev_tail_timestamp_lines_m))
         self.prev_summary_tail_chars_j = max(0, int(self.prev_summary_tail_chars_j))
+        self.summary_detail_level = min(5, max(1, int(self.summary_detail_level)))
         self.llm_call_retry_max = max(1, int(self.llm_call_retry_max))
         self.max_agent_value_chars = max(100, int(self.max_agent_value_chars))
         self.transcript_chunk_emit_duration_sec = max(30, int(self.transcript_chunk_emit_duration_sec))
@@ -174,10 +247,28 @@ def _dataclass_defaults(cls: type[Any]) -> dict[str, Any]:
 
 
 def _build_default_settings() -> dict[str, Any]:
+    default_profile_id = uuid.uuid4().hex[:8]
+    default_provider = _BUILTIN_PROVIDER_DEFAULTS["openai_compatible"]
+    llm_defaults = {
+        "active_profile_id": default_profile_id,
+        "profiles": [
+            {
+                "id": default_profile_id,
+                "name": default_provider["label"],
+                "provider": "openai_compatible",
+                "base_url": default_provider["base_url"],
+                "api_key": "",
+                "model_id": default_provider["model_id"],
+                "temperature": 0.7,
+                "context_window_size": 1000000,
+            }
+        ],
+    }
     return {
         "app": _dataclass_defaults(AppConfig),
         "whisper": _dataclass_defaults(WhisperConfig),
-        "llm": _dataclass_defaults(LLMConfig),
+        "tingwu": _dataclass_defaults(TingwuConfig),
+        "llm": llm_defaults,
         "database": _dataclass_defaults(DatabaseConfig),
         "cors": _dataclass_defaults(CORSConfig),
         "summarization": _dataclass_defaults(SummarizationConfig),
@@ -235,7 +326,63 @@ class JSONConfigManager:
                 loaded = json.load(f)
             if not isinstance(loaded, dict):
                 raise ValueError("配置文件根节点必须是 JSON 对象")
+            llm_raw = loaded.get("llm", {})
+            if isinstance(llm_raw, dict):
+                # Migration: old single-provider format → profiles format
+                if "provider" in llm_raw and "profiles" not in llm_raw and "providers" not in llm_raw:
+                    old_provider = str(llm_raw.get("provider", "openai_compatible"))
+                    defaults = _BUILTIN_PROVIDER_DEFAULTS.get(old_provider, {})
+                    profile_id = uuid.uuid4().hex[:8]
+                    migrated = {
+                        "active_profile_id": profile_id,
+                        "profiles": [{
+                            "id": profile_id,
+                            "name": defaults.get("label", old_provider),
+                            "provider": old_provider,
+                            "base_url": str(llm_raw.get("base_url") or defaults.get("base_url", "")),
+                            "api_key": str(llm_raw.get("api_key") or ""),
+                            "model_id": str(llm_raw.get("model_id") or defaults.get("model_id", "")),
+                            "temperature": float(llm_raw.get("temperature", 0.7)),
+                            "context_window_size": int(llm_raw.get("context_window_size", 1000000)),
+                        }],
+                    }
+                    loaded["llm"] = migrated
+                    logger.info("[JSONConfigManager] 已自动迁移 llm 单供应商配置为 Profile 格式")
+                # Migration: old multi-provider format → profiles format
+                elif "providers" in llm_raw and "profiles" not in llm_raw:
+                    old_active = str(llm_raw.get("active_provider", "openai_compatible"))
+                    old_providers = llm_raw.get("providers", {})
+                    profiles = []
+                    active_profile_id = ""
+                    for pid, cfg in old_providers.items():
+                        defaults = _BUILTIN_PROVIDER_DEFAULTS.get(pid, {})
+                        profile_id = uuid.uuid4().hex[:8]
+                        if pid == old_active:
+                            active_profile_id = profile_id
+                        profiles.append({
+                            "id": profile_id,
+                            "name": defaults.get("label", pid),
+                            "provider": pid,
+                            "base_url": str(cfg.get("base_url") or defaults.get("base_url", "")),
+                            "api_key": str(cfg.get("api_key") or ""),
+                            "model_id": str(cfg.get("model_id") or defaults.get("model_id", "")),
+                            "temperature": float(cfg.get("temperature", 0.7)),
+                            "context_window_size": int(cfg.get("context_window_size", 1000000)),
+                        })
+                    if not active_profile_id and profiles:
+                        active_profile_id = profiles[0]["id"]
+                    loaded["llm"] = {
+                        "active_profile_id": active_profile_id,
+                        "profiles": profiles,
+                    }
+                    logger.info("[JSONConfigManager] 已自动迁移 llm 多供应商配置为 Profile 格式")
             self._config = _deep_merge(DEFAULT_SETTINGS, loaded)
+            # Ensure llm section uses profiles format after merge
+            llm = self._config.get("llm", {})
+            if "providers" in llm and "profiles" not in llm:
+                # Post-merge cleanup: migration already handled above, but deep_merge
+                # may have re-introduced the old keys from DEFAULT_SETTINGS if loaded was empty
+                self._write_locked()
         except Exception as e:
             logger.warning(f"[JSONConfigManager] 读取配置失败，回退默认值: {e}")
             self._config = copy.deepcopy(DEFAULT_SETTINGS)
@@ -261,17 +408,96 @@ class JSONConfigManager:
             self._config[section] = _deep_merge(current, payload)
             self._write_locked()
 
-    def save_llm_config(self, payload: dict[str, Any]):
-        defaults = DEFAULT_SETTINGS["llm"]
-        llm_patch = {
-            "provider": str(payload.get("provider") or defaults["provider"]),
-            "base_url": str(payload.get("base_url") or defaults["base_url"]),
-            "api_key": str(payload.get("api_key") or defaults["api_key"]),
-            "model_id": str(payload.get("model_id") or defaults["model_id"]),
-            "temperature": float(payload.get("temperature", defaults["temperature"])),
-            "context_window_size": int(payload.get("context_window_size", defaults["context_window_size"])),
+    def add_profile(self, name: str, provider: str, payload: dict[str, Any] = None, profile_id: str = "") -> str:
+        """Create a new LLM profile and return its id."""
+        payload = payload or {}
+        provider_defaults = _BUILTIN_PROVIDER_DEFAULTS.get(provider, {})
+        if not profile_id:
+            profile_id = uuid.uuid4().hex[:8]
+        new_profile = {
+            "id": profile_id,
+            "name": str(name or provider_defaults.get("label", provider)),
+            "provider": provider,
+            "base_url": str(payload.get("base_url") or provider_defaults.get("base_url", "")),
+            "api_key": str(payload.get("api_key") or ""),
+            "model_id": str(payload.get("model_id") or provider_defaults.get("model_id", "")),
+            "temperature": float(payload.get("temperature", 0.7)),
+            "context_window_size": int(payload.get("context_window_size", 1000000)),
         }
-        self.update_section("llm", llm_patch)
+        with self._lock:
+            llm = self._config.get("llm", {})
+            profiles = llm.get("profiles", [])
+            profiles.append(new_profile)
+            llm["profiles"] = profiles
+            llm["active_profile_id"] = profile_id
+            self._config["llm"] = llm
+            self._write_locked()
+        return profile_id
+
+    def update_profile(self, profile_id: str, payload: dict[str, Any]):
+        """Update a specific profile's config."""
+        with self._lock:
+            llm = self._config.get("llm", {})
+            profiles = llm.get("profiles", [])
+            for i, p in enumerate(profiles):
+                if p.get("id") == profile_id:
+                    updated = copy.deepcopy(p)
+                    if "name" in payload:
+                        updated["name"] = str(payload["name"])
+                    if "provider" in payload:
+                        updated["provider"] = str(payload["provider"])
+                    if "base_url" in payload:
+                        updated["base_url"] = str(payload["base_url"])
+                    if "model_id" in payload:
+                        updated["model_id"] = str(payload["model_id"])
+                    if "temperature" in payload and payload["temperature"] is not None:
+                        updated["temperature"] = float(payload["temperature"])
+                    if "context_window_size" in payload and payload["context_window_size"] is not None:
+                        updated["context_window_size"] = int(payload["context_window_size"])
+                    if "api_key" in payload and payload.get("api_key"):
+                        updated["api_key"] = str(payload["api_key"])
+                    # If provider changed, fill defaults for fields not provided
+                    new_provider = updated.get("provider")
+                    if new_provider and new_provider != p.get("provider"):
+                        provider_defaults = _BUILTIN_PROVIDER_DEFAULTS.get(new_provider, {})
+                        if not payload.get("base_url"):
+                            updated["base_url"] = provider_defaults.get("base_url", "")
+                        if not payload.get("model_id"):
+                            updated["model_id"] = provider_defaults.get("model_id", "")
+                    profiles[i] = updated
+                    llm["profiles"] = profiles
+                    llm["active_profile_id"] = profile_id
+                    self._config["llm"] = llm
+                    self._write_locked()
+                    return
+            raise ValueError(f"Profile '{profile_id}' not found")
+
+    def delete_profile(self, profile_id: str):
+        """Delete a profile. Cannot delete the last one."""
+        with self._lock:
+            llm = self._config.get("llm", {})
+            profiles = llm.get("profiles", [])
+            if len(profiles) <= 1:
+                raise ValueError("Cannot delete the last profile")
+            profiles = [p for p in profiles if p.get("id") != profile_id]
+            # If deleted the active profile, switch to the first remaining one
+            if llm.get("active_profile_id") == profile_id:
+                llm["active_profile_id"] = profiles[0]["id"] if profiles else ""
+            llm["profiles"] = profiles
+            self._config["llm"] = llm
+            self._write_locked()
+
+    def set_active_profile(self, profile_id: str):
+        """Switch active LLM profile without changing config."""
+        with self._lock:
+            llm = self._config.get("llm", {})
+            profiles = llm.get("profiles", [])
+            found = any(p.get("id") == profile_id for p in profiles)
+            if not found:
+                raise ValueError(f"Profile '{profile_id}' not found")
+            llm["active_profile_id"] = profile_id
+            self._config["llm"] = llm
+            self._write_locked()
 
     def save_transcription_config(self, payload: dict[str, Any]):
         whisper_patch = {}
@@ -293,29 +519,43 @@ class JSONConfigManager:
             whisper_patch["faster_whisper_model_path"] = None
         if "enable_bilibili_subtitle_fetch" in payload:
             whisper_patch["enable_bilibili_subtitle_fetch"] = bool(payload["enable_bilibili_subtitle_fetch"])
-        if "enable_asr_transcription" in payload:
-            whisper_patch["enable_asr_transcription"] = bool(payload["enable_asr_transcription"])
         if "bilibili_sessdata" in payload:
             whisper_patch["bilibili_sessdata"] = str(payload.get("bilibili_sessdata") or "")
         if whisper_patch:
             self.update_section("whisper", whisper_patch)
+
+        tingwu_patch: dict[str, Any] = {}
+        if "tingwu_enabled" in payload:
+            tingwu_patch["enabled"] = bool(payload["tingwu_enabled"])
+        if "tingwu_config_path" in payload:
+            tingwu_patch["config_path"] = str(payload.get("tingwu_config_path") or "tingwu/config.json").strip()
+        if "tingwu_poll_interval_sec" in payload:
+            tingwu_patch["poll_interval_sec"] = max(1.0, float(payload["tingwu_poll_interval_sec"]))
+        if "tingwu_timeout_sec" in payload:
+            tingwu_patch["timeout_sec"] = max(60.0, float(payload["tingwu_timeout_sec"]))
+        if "tingwu_fallback_to_whisper" in payload:
+            tingwu_patch["fallback_to_whisper"] = bool(payload["tingwu_fallback_to_whisper"])
+        if tingwu_patch:
+            self.update_section("tingwu", tingwu_patch)
 
     def save_summarization_config(self, payload: dict[str, Any]):
         if not isinstance(payload, dict):
             raise ValueError("summarization payload 必须是 JSON 对象")
         patch: dict[str, Any] = {}
         if "mode" in payload:
-            patch["mode"] = str(payload.get("mode") or "auto").lower()
+            patch["mode"] = str(payload.get("mode") or "standard").lower()
 
         int_fields = [
             "auto_chunk_min_audio_duration_sec",
             "auto_chunk_min_transcript_lines",
+            "auto_chunk_min_plain_text_chars",
             "chunk_target_duration_sec",
             "chunk_min_duration_sec",
             "chunk_max_duration_sec",
             "boundary_jump_sec",
             "prev_tail_timestamp_lines_m",
             "prev_summary_tail_chars_j",
+            "summary_detail_level",
             "llm_call_retry_max",
             "max_agent_value_chars",
             "transcript_chunk_emit_duration_sec",
@@ -351,6 +591,7 @@ class JSONConfigManager:
             enable_mdns=bool(raw.get("enable_mdns", defaults["enable_mdns"])),
             frontend_dist_dir=str(raw.get("frontend_dist_dir", defaults["frontend_dist_dir"])),
             prompt_file=str(raw.get("prompt_file", defaults["prompt_file"])),
+            temp_dir=str(raw.get("temp_dir", defaults["temp_dir"])),
         )
 
     def get_whisper_config(self) -> WhisperConfig:
@@ -379,24 +620,64 @@ class JSONConfigManager:
             enable_bilibili_subtitle_fetch=bool(
                 raw.get("enable_bilibili_subtitle_fetch", defaults["enable_bilibili_subtitle_fetch"])
             ),
-            enable_asr_transcription=bool(
-                raw.get("enable_asr_transcription", defaults["enable_asr_transcription"])
-            ),
             bilibili_sessdata=str(raw.get("bilibili_sessdata", defaults["bilibili_sessdata"]) or ""),
             faster_whisper_model_path=faster_whisper_model_path,
         )
 
-    def get_llm_config(self) -> LLMConfig:
-        raw = self.get_raw_config().get("llm", {})
-        defaults = DEFAULT_SETTINGS["llm"]
-        return LLMConfig(
-            provider=str(raw.get("provider", defaults["provider"])),
-            base_url=str(raw.get("base_url", defaults["base_url"])),
-            api_key=str(raw.get("api_key", defaults["api_key"])),
-            model_id=str(raw.get("model_id", defaults["model_id"])),
-            temperature=float(raw.get("temperature", defaults["temperature"])),
-            context_window_size=int(raw.get("context_window_size", defaults["context_window_size"])),
+    def get_tingwu_config(self) -> TingwuConfig:
+        raw = self.get_raw_config().get("tingwu", {})
+        defaults = DEFAULT_SETTINGS["tingwu"]
+        return TingwuConfig(
+            enabled=bool(raw.get("enabled", defaults["enabled"])),
+            config_path=str(raw.get("config_path", defaults["config_path"])),
+            poll_interval_sec=float(raw.get("poll_interval_sec", defaults["poll_interval_sec"])),
+            timeout_sec=float(raw.get("timeout_sec", defaults["timeout_sec"])),
+            fallback_to_whisper=bool(raw.get("fallback_to_whisper", defaults["fallback_to_whisper"])),
         )
+
+    def get_llm_config(self) -> LLMConfig:
+        """Return single-provider LLMConfig for backward compat (active profile)."""
+        raw = self.get_raw_config().get("llm", {})
+        active_id = str(raw.get("active_profile_id", ""))
+        profiles = raw.get("profiles", [])
+        active_profile = None
+        for p in profiles:
+            if p.get("id") == active_id:
+                active_profile = p
+                break
+        if not active_profile and profiles:
+            active_profile = profiles[0]
+        if not active_profile:
+            return LLMConfig()
+        return LLMConfig(
+            provider=str(active_profile.get("provider", "openai_compatible")),
+            base_url=str(active_profile.get("base_url", "")),
+            api_key=str(active_profile.get("api_key") or ""),
+            model_id=str(active_profile.get("model_id") or ""),
+            temperature=float(active_profile.get("temperature", 0.7)),
+            context_window_size=int(active_profile.get("context_window_size", 1000000)),
+        )
+
+    def get_llm_profiles_config(self) -> LLMProfilesConfig:
+        """Return full profiles config."""
+        raw = self.get_raw_config().get("llm", {})
+        active_id = str(raw.get("active_profile_id", ""))
+        profiles_raw = raw.get("profiles", [])
+        profiles: list[LLMProfileConfig] = []
+        for p in profiles_raw:
+            profiles.append(LLMProfileConfig(
+                id=str(p.get("id", "")),
+                name=str(p.get("name", "")),
+                provider=str(p.get("provider", "openai_compatible")),
+                base_url=str(p.get("base_url") or ""),
+                api_key=str(p.get("api_key") or ""),
+                model_id=str(p.get("model_id") or ""),
+                temperature=float(p.get("temperature", 0.7)),
+                context_window_size=int(p.get("context_window_size", 1000000)),
+            ))
+        if not active_id and profiles:
+            active_id = profiles[0].id
+        return LLMProfilesConfig(active_profile_id=active_id, profiles=profiles)
 
     def get_database_config(self) -> DatabaseConfig:
         raw = self.get_raw_config().get("database", {})
@@ -427,6 +708,9 @@ class JSONConfigManager:
             auto_chunk_min_transcript_lines=int(
                 raw.get("auto_chunk_min_transcript_lines", defaults["auto_chunk_min_transcript_lines"])
             ),
+            auto_chunk_min_plain_text_chars=int(
+                raw.get("auto_chunk_min_plain_text_chars", defaults["auto_chunk_min_plain_text_chars"])
+            ),
             chunk_target_duration_sec=int(raw.get("chunk_target_duration_sec", defaults["chunk_target_duration_sec"])),
             chunk_min_duration_sec=int(raw.get("chunk_min_duration_sec", defaults["chunk_min_duration_sec"])),
             chunk_max_duration_sec=int(raw.get("chunk_max_duration_sec", defaults["chunk_max_duration_sec"])),
@@ -435,6 +719,7 @@ class JSONConfigManager:
                 raw.get("prev_tail_timestamp_lines_m", defaults["prev_tail_timestamp_lines_m"])
             ),
             prev_summary_tail_chars_j=int(raw.get("prev_summary_tail_chars_j", defaults["prev_summary_tail_chars_j"])),
+            summary_detail_level=int(raw.get("summary_detail_level", defaults["summary_detail_level"])),
             llm_call_retry_max=int(raw.get("llm_call_retry_max", defaults["llm_call_retry_max"])),
             fallback_to_standard_on_agent_error=bool(
                 raw.get("fallback_to_standard_on_agent_error", defaults["fallback_to_standard_on_agent_error"])
@@ -463,6 +748,10 @@ class Settings:
     @property
     def whisper(self) -> WhisperConfig:
         return self._manager.get_whisper_config()
+
+    @property
+    def tingwu(self) -> TingwuConfig:
+        return self._manager.get_tingwu_config()
 
     @property
     def llm(self) -> LLMConfig:
@@ -514,4 +803,5 @@ def to_llm_config(settings: Settings) -> "LLMConfigDataclass":
         context_window_size=llm_cfg.context_window_size,
         provider=llm_cfg.provider,
     )
+
 

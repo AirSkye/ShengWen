@@ -5,6 +5,7 @@ import FloatingToolbarShell from './FloatingToolbarShell.vue'
 import FloatingToolbarChapterNav from './FloatingToolbarChapterNav.vue'
 
 const activeTab = defineModel<string>('activeTab', { required: true })
+const beautifySummary = defineModel<boolean>('beautifySummary', { required: true })
 
 defineProps<{
   selectedTask: Task | null
@@ -88,6 +89,27 @@ const emit = defineEmits<{
                 >
                   <PhDownloadSimple :size="14" />
                   下载 Markdown
+                </button>
+                <button
+                  type="button"
+                  class="w-full flex items-center justify-between gap-3 px-3 py-2.5 text-xs text-slate-700 border-t border-slate-100 hover:bg-slate-50 transition-colors"
+                  role="switch"
+                  :aria-checked="beautifySummary"
+                  @click.stop="beautifySummary = !beautifySummary"
+                >
+                  <span class="flex items-center gap-2">
+                    <PhSparkle :size="14" :weight="beautifySummary ? 'fill' : 'regular'" />
+                    <span>结果美化</span>
+                  </span>
+                  <span
+                    class="relative inline-flex h-5 w-9 shrink-0 rounded-full transition-colors duration-200"
+                    :class="beautifySummary ? 'bg-blue-500' : 'bg-slate-300'"
+                  >
+                    <span
+                      class="absolute top-0.5 h-4 w-4 rounded-full bg-white shadow-sm transition-transform duration-200"
+                      :class="beautifySummary ? 'translate-x-[18px]' : 'translate-x-0.5'"
+                    ></span>
+                  </span>
                 </button>
                 <div
                   v-if="selectedTask?.summary"

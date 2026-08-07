@@ -94,7 +94,7 @@ fi
 
 if [[ ! -d "frontend/dist" ]]; then
   echo "[ERROR] 未找到前端构建目录 frontend/dist。"
-  echo "[ERROR] 请先执行 ./deploy一键部署.sh 或手动运行 frontend/npm run build。"
+  echo "[ERROR] 请先执行 ./deploy一键部署.sh 或手动运行 (cd frontend && npm run build)。"
   exit 1
 fi
 

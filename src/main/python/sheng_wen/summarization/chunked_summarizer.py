@@ -11,7 +11,22 @@ from ..llm.llm import LLM, LLMError, LLMMessage
 from ..utils.logger import logger
 from ..worker import TaskCancelledError
 from .assembler import assemble_chunk_summaries
-from .chunker import TranscriptChunk, split_transcript_into_chunks, tail_timestamp_lines
+from .chunker import (
+    TranscriptChunk,
+    count_transcript_content_chars,
+    split_transcript_into_chunks,
+    tail_timestamp_lines,
+)
+from .output_cleaner import (
+    clean_summary_output,
+    count_summary_timestamps,
+    limit_summary_timestamp_density,
+)
+from .fidelity import (
+    assess_fidelity,
+    candidate_preserves_fidelity,
+    format_missing_anchors,
+)
 from .prompt_builder import build_chunk_user_prompt, generate_structure_overview
 from .protocol import parse_state_ops, strip_state_instruction_blocks
 from .state_manager import DynamicStateManager
@@ -56,6 +71,70 @@ def truncate_discussed_topics(topics: str, max_items: int = 10) -> str:
     return topics
 
 
+def _visible_summary_char_count(text: str) -> int:
+    cleaned = strip_state_instruction_blocks(text or "")
+    cleaned = re.sub(r"\{\{chunk_\d+_(?:start|ended)\}\}", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\{\{.*?\}\}", "", cleaned)
+    cleaned = re.sub(r"\s+", "", cleaned)
+    return len(cleaned)
+
+
+def _maximum_agent_timestamp_count(visible_chars: int) -> int:
+    return max(3, min(90, (max(0, int(visible_chars)) + 349) // 350))
+
+
+def _estimate_chunk_min_output_chars(chunk: TranscriptChunk, detail_level: int) -> int:
+    text_chars = count_transcript_content_chars(chunk.text)
+    ratios = {
+        1: 0.10,
+        2: 0.16,
+        3: 0.25,
+        4: 0.38,
+        5: 0.52,
+    }
+    floors = {
+        1: 350,
+        2: 500,
+        3: 800,
+        4: 1200,
+        5: 1600,
+    }
+    level = max(1, min(5, int(detail_level)))
+    target = max(floors[level], int(text_chars * ratios[level]))
+    return min(target, 6000)
+
+
+def _merge_document_topic(summary: str, document_topic: str) -> str:
+    normalized = (document_topic or "").strip()
+    if not normalized:
+        return summary
+    if not (normalized.startswith("{{") and normalized.endswith("}}")):
+        normalized = f"{{{{{normalized.strip('{} ')}}}}}"
+
+    remaining = (summary or "").lstrip()
+    leading_topic = re.compile(r"^\{\{(?!chunk_)(?!opt-tools)([^{}\n]+)\}\}\s*", re.IGNORECASE)
+    while leading_topic.match(remaining):
+        remaining = leading_topic.sub("", remaining, count=1).lstrip()
+    return f"{normalized}\n\n{remaining}".rstrip()
+
+
+def _extract_last_state_ops_block(text: str) -> str:
+    matches = list(re.finditer(r"```state_ops\s*\{[\s\S]*?\}\s*```", text or "", re.IGNORECASE))
+    if not matches:
+        return ""
+    return matches[-1].group(0)
+
+
+def _insert_before_state_ops(text: str, insertion: str) -> str:
+    state_block = _extract_last_state_ops_block(text)
+    if not state_block:
+        return f"{text.rstrip()}\n\n{insertion.strip()}"
+    idx = text.rfind(state_block)
+    if idx < 0:
+        return f"{text.rstrip()}\n\n{insertion.strip()}"
+    return f"{text[:idx].rstrip()}\n\n{insertion.strip()}\n\n{text[idx:].lstrip()}"
+
+
 @dataclass
 class ChunkedSummaryResult:
     summary_text: str
@@ -78,6 +157,7 @@ class ChunkedSummarizer:
         prev_summary_tail_chars_j: int,
         llm_call_retry_max: int,
         max_agent_value_chars: int,
+        summary_detail_level: int = 4,
         cancel_check: Callable[[], bool] | None = None,
         chunk_debug_dump_enabled: bool = False,
         chunk_debug_dump_dir: str = "temp/chunk_debug",
@@ -92,6 +172,7 @@ class ChunkedSummarizer:
         self._prev_summary_tail_chars_j = max(0, int(prev_summary_tail_chars_j))
         self._llm_call_retry_max = max(1, int(llm_call_retry_max))
         self._max_agent_value_chars = max(100, int(max_agent_value_chars))
+        self._summary_detail_level = max(1, min(5, int(summary_detail_level)))
         self._cancel_check = cancel_check
         self._chunk_debug_dump_enabled = bool(chunk_debug_dump_enabled)
         self._chunk_debug_dump_dir = Path(chunk_debug_dump_dir)
@@ -126,6 +207,8 @@ class ChunkedSummarizer:
                 total_chunks=len(chunks),
                 dynamic_state=state,
                 structure_overview=structure,
+                detail_level=self._summary_detail_level,
+                min_output_chars=_estimate_chunk_min_output_chars(chunk, self._summary_detail_level),
             )
             chunk_prefix = ""
             if on_chunk_stream and chunk_outputs:
@@ -142,6 +225,14 @@ class ChunkedSummarizer:
             output = await self._call_llm_with_retry(
                 user_prompt,
                 on_partial=emit_chunk_stream if on_chunk_stream else None,
+            )
+            output = await self._expand_chunk_if_too_short(
+                output=output,
+                chunk=chunk,
+                chunk_index=idx,
+                total_chunks=len(chunks),
+                user_prompt=user_prompt,
+                min_output_chars=_estimate_chunk_min_output_chars(chunk, self._summary_detail_level),
             )
             chunk_outputs.append(output)
 
@@ -164,9 +255,22 @@ class ChunkedSummarizer:
         # 提取最后一块生成的文档主题（如果有）
         doc_topic = state.snapshot().get("agent", {}).get("文档主题", "").strip()
         if doc_topic:
-            # 将主题添加到摘要开头
-            final_summary = f"{doc_topic}\n{final_summary}"
-            assembly_logs.append(f"已添加文档主题: {doc_topic}")
+            final_summary = _merge_document_topic(final_summary, doc_topic)
+            assembly_logs.append(f"已合并文档主题: {doc_topic}")
+        final_summary = clean_summary_output(final_summary)
+        timestamp_count = count_summary_timestamps(final_summary)
+        maximum_timestamp_count = _maximum_agent_timestamp_count(
+            _visible_summary_char_count(final_summary)
+        )
+        if timestamp_count > maximum_timestamp_count:
+            final_summary = limit_summary_timestamp_density(
+                final_summary,
+                maximum_timestamp_count,
+            )
+            assembly_logs.append(
+                "已收敛时间戳密度: "
+                f"{timestamp_count}->{count_summary_timestamps(final_summary)}"
+            )
 
         return ChunkedSummaryResult(
             summary_text=final_summary,
@@ -286,6 +390,96 @@ class ChunkedSummarizer:
                 logger.warning(f"[ChunkedSummarizer] 分块最终流式回调失败: {e}")
         return final_text
 
+    async def _expand_chunk_if_too_short(
+        self,
+        output: str,
+        chunk: TranscriptChunk,
+        chunk_index: int,
+        total_chunks: int,
+        user_prompt: str,
+        min_output_chars: int,
+    ) -> str:
+        if min_output_chars <= 0:
+            return output
+        current_chars = _visible_summary_char_count(output)
+        fidelity = assess_fidelity(chunk.text, output)
+        detail_five_needs_repair = self._summary_detail_level >= 5 and fidelity.needs_repair
+        length_needs_repair = current_chars < int(min_output_chars * 0.9)
+        if not length_needs_repair and not detail_five_needs_repair:
+            return output
+
+        self._ensure_not_cancelled()
+        no_timestamp_rule = ""
+        if not chunk.has_timestamps:
+            no_timestamp_rule = "\n- 原文没有时间戳，修订稿中不要添加、猜测或伪造任何时间戳。"
+
+        fidelity_rule = ""
+        if detail_five_needs_repair:
+            fidelity_rule = f"""
+- 这是详细度 5 的事实保真修订：逐项核对原文并补回尚未明确保留的数字、范围、单位、引号短语和技术标识，包括：{format_missing_anchors(fidelity)}。
+- 把补回的事实放回原文对应的问答、案例、步骤或论证上下文；不要重复结论、堆砌锚点或虚构解释。
+"""
+
+        repair_prompt = f"""请把下面这个分块总结扩写成更完整的修订版。
+
+要求：
+- 输出完整修订版，不要输出修改说明。
+- 保留原有 Markdown 结构、主题标签、`{{{{chunk_{chunk_index}_ended}}}}` 标记和最后的 `state_ops` 代码块。
+- 当前可读正文约 {current_chars} 字符，目标至少 {min_output_chars} 字符；按原文顺序补足遗漏的问答链、观点归属、数字、条件、清单、案例、论证过程和必要细节。
+- 只有寒暄、口头禅、机械复述与无信息操作可以删除；不要用空泛概括替代具体内容，也不要虚构信息。
+- 如果某个小节还没自然结束，先补完该小节，再进入新的一级章节；不要出现小节没写完就跳到下一章的情况。{no_timestamp_rule}
+{fidelity_rule}
+
+原始分块提示：
+```markdown
+{user_prompt}
+```
+
+当前草稿：
+```markdown
+{output}
+```
+"""
+        try:
+            expanded = await self._call_llm_with_retry(repair_prompt)
+        except Exception as e:
+            logger.warning(f"[ChunkedSummarizer] 分块 {chunk_index} 扩写失败，保留原结果: {e}")
+            return output
+
+        expanded = truncate_after_state_ops(expanded)
+        marker = f"{{{{chunk_{chunk_index}_ended}}}}"
+        if marker not in expanded:
+            expanded = _insert_before_state_ops(expanded, marker)
+
+        if "```state_ops" not in expanded:
+            original_state_ops = _extract_last_state_ops_block(output)
+            if original_state_ops:
+                expanded = f"{expanded.rstrip()}\n\n{original_state_ops}"
+
+        expanded_chars = _visible_summary_char_count(expanded)
+        expanded_fidelity = assess_fidelity(chunk.text, expanded)
+        if not candidate_preserves_fidelity(chunk.text, output, expanded):
+            logger.info(
+                f"[ChunkedSummarizer] 分块 {chunk_index} 修订未通过保真校验，保留原结果: "
+                f"chars={current_chars}->{expanded_chars}, "
+                f"anchors={fidelity.covered_count}->{expanded_fidelity.covered_count}"
+            )
+            return output
+
+        if expanded_chars <= current_chars and expanded_fidelity.covered_count <= fidelity.covered_count:
+            logger.info(
+                f"[ChunkedSummarizer] 分块 {chunk_index} 修订未增加有效内容 "
+                f"({current_chars}->{expanded_chars})，保留原结果"
+            )
+            return output
+
+        logger.info(
+            f"[ChunkedSummarizer] 分块 {chunk_index + 1}/{total_chunks} 已扩写: "
+            f"{current_chars}->{expanded_chars}, target={min_output_chars}, "
+            f"anchors={fidelity.covered_count}->{expanded_fidelity.covered_count}"
+        )
+        return expanded
+
     def _ensure_not_cancelled(self) -> None:
         if self._cancel_check and self._cancel_check():
             raise TaskCancelledError("任务已取消，停止分块总结。")
@@ -310,6 +504,8 @@ class ChunkedSummarizer:
                         "start_timestamp_sec": chunk.start_timestamp_sec,
                         "end_timestamp_sec": chunk.end_timestamp_sec,
                         "line_count": chunk.line_count,
+                        "has_timestamps": chunk.has_timestamps,
+                        "label": chunk.label,
                     },
                     ensure_ascii=False,
                     indent=2,

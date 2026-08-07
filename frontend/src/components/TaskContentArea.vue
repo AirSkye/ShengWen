@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { PhXCircle } from '@phosphor-icons/vue'
+import { PhDownloadSimple, PhXCircle } from '@phosphor-icons/vue'
 import { computed, watch, nextTick, ref, onBeforeUnmount } from 'vue'
-import type { Task, MarkdownHeadingItem } from '../types'
+import type { Task, MarkdownHeadingItem, TranscriptionMeta } from '../types'
 import { TaskStatus } from '../types'
 import TaskMetaCard from './TaskMetaCard.vue'
+import ProcessingStatusCard from './ProcessingStatusCard.vue'
 import { countWords } from '../utils/formatters'
 import { normalizeAccidentalInlineCodeBlocks } from '../utils/markdownNormalizer'
 import { normalizeMermaidSvgLayout } from '../utils/mermaidLayout'
@@ -21,6 +22,7 @@ interface Props {
   task: Task
   activeTab: 'summary' | 'transcript'
   compiledMarkdown: string
+  beautifySummary: boolean
   summaryHighlightRequest?: SummaryHighlightRequest | null
   headingJumpRequest?: { id: string; requestId: number } | null
   topic: string
@@ -43,6 +45,45 @@ const emit = defineEmits<{
 const isCompleted = computed(() => props.task.status === TaskStatus.COMPLETED)
 const isFailed = computed(() => props.task.status === TaskStatus.FAILED)
 const isLoading = computed(() => !isCompleted.value && !isFailed.value)
+const transcriptionMeta = computed<TranscriptionMeta>(() => {
+  const rawValue = props.task.transcription_meta
+  if (!rawValue) return {}
+  try {
+    const parsed = JSON.parse(rawValue)
+    return parsed && typeof parsed === 'object' ? parsed as TranscriptionMeta : {}
+  } catch {
+    return {}
+  }
+})
+const providerLabel = computed(() => {
+  const provider = transcriptionMeta.value.provider || ''
+  if (provider === 'tingwu') return '通义听悟'
+  if (provider === 'fast_whisper_fallback') return '本地 Whisper（回退）'
+  if (provider === 'fast_whisper') return '本地 Whisper'
+  if (provider === 'bilibili_subtitle') return 'B 站字幕'
+  if (provider === 'bilibili_multipart') return 'B 站分P转录'
+  if (provider === 'raw_text') return '文本导入'
+  if (provider === 'browser') return '浏览器上传'
+  return '转录服务'
+})
+const transcriptionMessage = computed(() => {
+  if (props.task.status === TaskStatus.SUMMARIZING) {
+    return props.task.summary_mode === 'agent'
+      ? '转录完成，Agent 正在分块理解并整合内容'
+      : '转录完成，正在生成结构化总结'
+  }
+  if (transcriptionMeta.value.message) return transcriptionMeta.value.message
+  if (props.task.status === TaskStatus.PENDING) return '任务正在排队'
+  if (props.task.status === TaskStatus.DOWNLOADING) return '正在下载媒体'
+  if (props.task.status === TaskStatus.UPLOADING) return '正在上传媒体'
+  if (props.task.status === TaskStatus.TRANSCRIBING) return '正在转录媒体'
+  return '处理完成'
+})
+const apiBaseUrl = String(import.meta.env.VITE_API_BASE_URL || '').replace(/\/$/, '')
+const subtitleDownloadUrl = computed(() => {
+  if (!transcriptionMeta.value.subtitle_path) return ''
+  return `${apiBaseUrl}/tasks/${encodeURIComponent(props.task.id)}/subtitle`
+})
 const contentScrollRef = ref<HTMLElement | null>(null)
 const summaryArticleRef = ref<HTMLElement | null>(null)
 const SUMMARY_HIGHLIGHT_CLASS = 'summary-search-highlight'
@@ -503,7 +544,7 @@ onBeforeUnmount(() => {
 
 <template>
   <div ref="contentScrollRef" class="flex-1 overflow-y-auto overflow-x-auto p-4 md:p-8 pt-16 md:pt-20 custom-scrollbar">
-    <div class="max-w-4xl mx-auto">
+    <div :class="[beautifySummary ? 'max-w-5xl' : 'max-w-4xl', 'mx-auto']">
       <!-- 错误状态 -->
       <div v-if="isFailed" class="bg-red-50 border border-red-100 p-6 rounded-2xl mb-6">
         <div class="flex items-center gap-3 text-red-700 font-bold mb-2">
@@ -514,14 +555,27 @@ onBeforeUnmount(() => {
       </div>
 
       <!-- 加载状态 -->
-      <div v-else-if="isLoading && !showContent" class="flex flex-col items-center justify-center h-full pt-20">
-        <div class="w-14 h-14 border-4 border-blue-100 border-t-blue-500 rounded-full animate-spin mb-6"></div>
-        <h3 class="text-lg font-medium text-slate-700">正在处理中...</h3>
-        <p class="text-slate-400 mt-2">这通常需要几分钟，请稍候</p>
+      <div v-else-if="isLoading && !showContent" class="pt-7 md:pt-12">
+        <ProcessingStatusCard
+          :task="task"
+          :meta="transcriptionMeta"
+          :provider-label="providerLabel"
+          :message="transcriptionMessage"
+        />
       </div>
 
       <!-- 成功内容区 -->
       <div v-else class="bg-white rounded-2xl shadow-sm border border-slate-200 min-h-[500px] relative">
+        <ProcessingStatusCard
+          v-if="isLoading"
+          class="m-4 md:m-6"
+          :task="task"
+          :meta="transcriptionMeta"
+          :provider-label="providerLabel"
+          :message="transcriptionMessage"
+          compact
+        />
+
         <!-- AI 总结 Tab -->
         <div v-show="activeTab === 'summary'">
           <!-- 顶部元信息卡片 -->
@@ -542,10 +596,18 @@ onBeforeUnmount(() => {
           <!-- 总结内容 - 添加主题容器类 -->
           <article
             ref="summaryArticleRef"
-            class="prose prose-sm md:prose-base prose-slate prose-headings:font-bold prose-a:text-blue-600 hover:prose-a:underline prose-img:rounded-xl max-w-none px-8 py-8 ss-shared-prose markdown-theme-container"
+            :class="[
+              'prose prose-sm md:prose-base prose-slate prose-headings:font-bold prose-a:text-blue-600 hover:prose-a:underline prose-img:rounded-xl max-w-none py-8 ss-shared-prose markdown-theme-container',
+              beautifySummary ? 'px-6 md:px-10 ss-summary-report-shell' : 'px-8',
+            ]"
             :data-theme="currentThemeId"
           >
-            <div v-if="task.summary" data-summary-content v-html="compiledMarkdown"></div>
+            <div
+              v-if="task.summary"
+              data-summary-content
+              :class="beautifySummary ? 'ss-report-layout ss-summary-report-content' : ''"
+              v-html="compiledMarkdown"
+            ></div>
             <p v-else class="text-slate-400 italic">暂无总结内容</p>
           </article>
         </div>
@@ -554,6 +616,18 @@ onBeforeUnmount(() => {
         <div v-show="activeTab === 'transcript'" class="px-8 py-8">
           <div class="flex justify-between items-center mb-6">
             <h3 class="text-lg font-bold text-slate-800">全文转录</h3>
+            <a
+              v-if="subtitleDownloadUrl"
+              :href="subtitleDownloadUrl"
+              class="inline-flex items-center gap-1.5 rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs font-medium text-blue-700 hover:bg-blue-100"
+              download
+            >
+              <PhDownloadSimple :size="15" />
+              下载 SRT<span v-if="transcriptionMeta.subtitle_count">（{{ transcriptionMeta.subtitle_count }} 条）</span>
+            </a>
+          </div>
+          <div v-if="transcriptionMeta.stage" class="mb-4 rounded-xl border border-slate-200 bg-slate-50 px-4 py-3 text-xs text-slate-600">
+            {{ providerLabel }} · {{ transcriptionMessage }}
           </div>
           <div class="space-y-4 text-slate-600 leading-relaxed font-normal">
             <p v-if="task.transcript" class="whitespace-pre-wrap text-sm leading-relaxed">{{ task.transcript }}</p>

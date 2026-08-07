@@ -1,12 +1,12 @@
 import asyncio
+import glob
 import json
 import os
 import re
-import time
 import uuid
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Tuple, Optional
 import yt_dlp
 
 from ..worker import Worker, TaskCancelledError
@@ -22,44 +22,27 @@ class VideoDownloaderWorker(Worker):
         self,
         name: str,
         next_worker: Worker = None,
-        transcriber_worker_factory: Any = None,
         summary_worker: Worker = None,
-        transcription_settings_manager: Any = None
+        summary_worker_factory: Callable[[], Awaitable[Worker]] | None = None,
+        transcription_settings_manager: Any = None,
+        output_dir: str = "temp",
     ):
         super().__init__(name)
         self.next_worker = next_worker
-        self.transcriber_worker_factory = transcriber_worker_factory
         self.summary_worker = summary_worker
+        self.summary_worker_factory = summary_worker_factory
         self.transcription_settings_manager = transcription_settings_manager
-        self.output_dir = "temp"
+        self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
-    def _asr_enabled(self) -> bool:
-        manager = self.transcription_settings_manager
-        if manager is None:
-            return False
-        try:
-            settings = manager.get_settings()
-            return bool(settings.get("enable_asr_transcription", False))
-        except Exception as e:
-            logger.warning(f"[{self.name}] 读取 ASR 开关失败，默认关闭: {e}")
-            return False
-
-    def _resolve_transcriber_worker_if_needed(self) -> Worker | None:
-        if self.next_worker is not None:
-            return self.next_worker
-        if not self._asr_enabled():
-            return None
-        if not self.transcriber_worker_factory or not self._loop:
-            return None
-        try:
-            future = asyncio.run_coroutine_threadsafe(self.transcriber_worker_factory(), self._loop)
-            self.next_worker = future.result(timeout=30)
-            logger.info(f"[{self.name}] 已按需初始化转录 worker（ASR 已开启）。")
-            return self.next_worker
-        except Exception as e:
-            logger.error(f"[{self.name}] 按需初始化转录 worker 失败: {e}", exc_info=True)
-            return None
+    async def _enqueue_summary(self, payload: Dict[str, Any]):
+        summary_worker = self.summary_worker
+        if summary_worker is None and self.summary_worker_factory is not None:
+            summary_worker = await self.summary_worker_factory()
+            self.summary_worker = summary_worker
+        if summary_worker is None:
+            raise RuntimeError("总结工作单元尚未配置")
+        await summary_worker.add_task(payload)
 
     @staticmethod
     def _is_bilibili_url(video_url: str) -> bool:
@@ -172,34 +155,6 @@ class VideoDownloaderWorker(Worker):
         if env_cookie:
             return env_cookie, "env"
         return "", "none"
-
-    @staticmethod
-    def _normalize_download_url(video_url: str) -> str:
-        try:
-            parsed = urlparse(video_url)
-            netloc = (parsed.netloc or "").lower()
-            if "bilibili.com" in netloc:
-                # 移除无关追踪参数，降低 412 风险；分P由 payload.bilibili_parts 管理。
-                return f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-            return video_url
-        except Exception:
-            return video_url
-
-    @staticmethod
-    def _write_temp_bilibili_cookie_file(sessdata: str) -> str:
-        if not sessdata:
-            return ""
-        os.makedirs("temp", exist_ok=True)
-        cookie_path = os.path.join("temp", f"bilibili_cookie_{uuid.uuid4().hex}.txt")
-        now = int(time.time()) + 30 * 24 * 3600
-        # Netscape cookie format: domain, include_subdomains, path, secure, expires, name, value
-        lines = [
-            "# Netscape HTTP Cookie File",
-            f".bilibili.com\tTRUE\t/\tTRUE\t{now}\tSESSDATA\t{sessdata}",
-        ]
-        with open(cookie_path, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines) + "\n")
-        return cookie_path
 
     @staticmethod
     def _download_text(url: str, extra_headers: Dict[str, Any] | None = None) -> str:
@@ -372,9 +327,173 @@ class VideoDownloaderWorker(Worker):
                 logger.warning(f"[{self.name}] 提取分P {idx + 1} 字幕失败: {e}")
         return results
 
+    def _find_downloaded_media_file(self, base_path: str) -> str | None:
+        for ext in (".m4a", ".m4s", ".mp3", ".mp4", ".webm", ".opus", ".ogg", ".wav", ".flac", ".aac"):
+            candidate = base_path + ext
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 0:
+                return candidate
+        matches = [
+            path for path in glob.glob(base_path + ".*")
+            if os.path.isfile(path) and os.path.getsize(path) > 0
+        ]
+        if matches:
+            matches.sort(key=lambda path: os.path.getmtime(path), reverse=True)
+            return matches[0]
+        return None
+
+    def _download_bilibili_part_audio(
+        self,
+        video_url: str,
+        part_index: int,
+        task_id: str,
+    ) -> str | None:
+        if self.is_task_cancelled(task_id):
+            raise TaskCancelledError(f"任务已取消，跳过分P音频下载: {task_id}")
+
+        base_path = os.path.join(self.output_dir, f"{task_id}_p{part_index + 1}")
+        existing = self._find_downloaded_media_file(base_path)
+        if existing:
+            logger.info(f"[{self.name}] 复用已下载的分P音频: {existing}")
+            return existing
+
+        ffmpeg_location = FFmpegHelper.get_yt_dlp_ffmpeg_location()
+
+        def progress_hook(d):
+            if self.is_task_cancelled(task_id):
+                raise TaskCancelledError(f"任务已取消，停止分P音频下载: {task_id}")
+            if d.get("status") == "error":
+                raise yt_dlp.utils.DownloadError(str(d.get("error") or "yt-dlp download error"))
+
+        ydl_opts = {
+            "outtmpl": base_path + ".%(ext)s",
+            "format": "bestaudio/best",
+            "playlist_items": str(part_index + 1),
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "m4a",
+            }],
+            "progress_hooks": [progress_hook],
+            "writethumbnail": False,
+            "writesubtitles": False,
+        }
+        if ffmpeg_location:
+            ydl_opts["ffmpeg_location"] = ffmpeg_location
+
+        logger.info(f"[{self.name}] 下载分P {part_index + 1} 音频用于 ASR: {video_url}")
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.extract_info(video_url, download=True)
+
+        downloaded = self._find_downloaded_media_file(base_path)
+        if not downloaded:
+            logger.warning(f"[{self.name}] 分P {part_index + 1} 音频下载完成但未找到输出文件")
+            return None
+        return downloaded
+
+    def _transcription_result_to_transcript(self, result: Any) -> str:
+        lines: List[str] = []
+        for seg in getattr(result, "segments", []) or []:
+            if not isinstance(seg, dict):
+                continue
+            text = str(seg.get("text") or "").replace("\n", " ").strip()
+            if not text:
+                continue
+            try:
+                start = float(seg.get("start") or 0.0)
+            except (TypeError, ValueError):
+                start = 0.0
+            lines.append(f"{self._format_duration(start)}{text}\n")
+        return "".join(lines)
+
+    def _transcribe_bilibili_part_via_asr(
+        self,
+        video_url: str,
+        part_index: int,
+        task_id: str,
+        video_info: Dict[str, Any],
+    ) -> Dict[str, Any] | None:
+        if self.next_worker is None or not hasattr(self.next_worker, "transcribe_media_file"):
+            logger.warning(f"[{self.name}] 无可用转录 worker，无法对分P {part_index + 1} 执行 ASR")
+            return None
+
+        audio_path = self._download_bilibili_part_audio(video_url, part_index, task_id)
+        if not audio_path:
+            return None
+
+        from ..db import TaskStatus
+        from ..task_updater import update_and_notify
+        self._submit_coro(update_and_notify(task_id, {"status": TaskStatus.TRANSCRIBING}))
+
+        result = self.next_worker.transcribe_media_file(audio_path, task_id=task_id)
+        transcript = self._transcription_result_to_transcript(result)
+        if not transcript.strip():
+            logger.warning(f"[{self.name}] 分P {part_index + 1} ASR 结果为空")
+            return None
+
+        pages = video_info.get("pages", [])
+        part_title = None
+        part_duration = getattr(result, "audio_duration", None)
+        if isinstance(pages, list) and len(pages) > part_index:
+            page_info = pages[part_index]
+            if isinstance(page_info, dict):
+                part_title = page_info.get("part")
+                part_duration = page_info.get("duration") or part_duration
+
+        return {
+            "title": video_info.get("title"),
+            "duration": part_duration,
+            "transcript": transcript,
+            "language": getattr(result, "language", None),
+            "is_auto": True,
+            "part_index": part_index,
+            "part_title": part_title,
+            "source": "asr",
+            "audio_path": audio_path,
+            "transcription_time": getattr(result, "transcription_time", None),
+        }
+
+    def _collect_bilibili_multi_part_transcripts(
+        self,
+        video_url: str,
+        sessdata: str,
+        task_id: str,
+        part_indices: List[int],
+        video_info: Dict[str, Any],
+        subtitle_fetch_enabled: bool,
+    ) -> List[Dict[str, Any]]:
+        results: List[Dict[str, Any]] = []
+        for idx in part_indices:
+            if self.is_task_cancelled(task_id):
+                raise TaskCancelledError(f"任务已取消，停止分P处理: {task_id}")
+
+            result: Dict[str, Any] | None = None
+            if subtitle_fetch_enabled:
+                try:
+                    result = asyncio.run(self._extract_bilibili_subtitle_via_api(video_url, sessdata, idx))
+                    if result:
+                        result["source"] = "subtitle"
+                        logger.info(
+                            f"[{self.name}] 分P {idx + 1} 使用字幕: "
+                            f"{result.get('part_title') or f'P{idx + 1}'}"
+                        )
+                except Exception as e:
+                    logger.warning(f"[{self.name}] 分P {idx + 1} 字幕提取失败，将尝试 ASR: {e}")
+
+            if not result:
+                try:
+                    result = self._transcribe_bilibili_part_via_asr(video_url, idx, task_id, video_info)
+                    if result:
+                        logger.info(f"[{self.name}] 分P {idx + 1} 已使用 ASR 转录")
+                except Exception as e:
+                    logger.warning(f"[{self.name}] 分P {idx + 1} ASR 失败: {e}", exc_info=True)
+
+            if result:
+                results.append(result)
+
+        return results
+
     def _merge_transcripts_with_offset(
         self, subtitle_results: List[Dict[str, Any]], video_info: Dict[str, Any]
-    ) -> Tuple[str, int]:
+    ) -> Tuple[str, float]:
         """
         合并多个分P的字幕，计算时间偏移。
 
@@ -409,6 +528,10 @@ class VideoDownloaderWorker(Worker):
 
             # 获取该分P时长
             part_duration = duration_map.get(part_idx, result.get("duration", 0))
+            try:
+                part_duration = float(part_duration or 0)
+            except (TypeError, ValueError):
+                part_duration = 0.0
             total_duration += part_duration
 
             if time_offset > 0 and transcript:
@@ -445,7 +568,12 @@ class VideoDownloaderWorker(Worker):
     def _try_process_with_bilibili_subtitle(self, payload: Dict[str, Any]) -> bool:
         video_url = str(payload.get("video_url") or "")
         task_id = payload.get("task_id")
-        subtitle_only = bool(payload.get("subtitle_only"))
+        summary_mode = str(payload.get("summary_mode") or "standard").strip().lower()
+        if summary_mode not in {"auto", "standard", "agent"}:
+            summary_mode = "standard"
+        summary_style = str(payload.get("summary_style") or "classic").strip().lower()
+        if summary_style not in {"classic", "report"}:
+            summary_style = "classic"
 
         if not video_url or not task_id:
             return False
@@ -453,17 +581,17 @@ class VideoDownloaderWorker(Worker):
             raise TaskCancelledError(f"任务已取消，跳过字幕直取: {task_id}")
         if not self._is_bilibili_url(video_url):
             return False
-        if self.summary_worker is None:
+        if self.summary_worker is None and self.summary_worker_factory is None:
             return False
 
+        subtitle_fetch_enabled = True
         if self.transcription_settings_manager is not None:
             try:
                 settings = self.transcription_settings_manager.get_settings()
-                if not bool(settings.get("enable_bilibili_subtitle_fetch", True)):
-                    return False
+                subtitle_fetch_enabled = bool(settings.get("enable_bilibili_subtitle_fetch", True))
             except Exception as e:
                 logger.warning(f"[{self.name}] 读取转录设置失败，继续回退 ASR: {e}")
-                return False
+                subtitle_fetch_enabled = False
 
         sessdata, cookie_source = self._resolve_bilibili_sessdata(payload)
 
@@ -476,30 +604,24 @@ class VideoDownloaderWorker(Worker):
             if mode == "merge" and isinstance(indices, list) and len(indices) > 0:
                 # 合并模式：提取多个分P的字幕并合并
                 return self._try_process_bilibili_multi_part_merge(
-                    video_url, sessdata, task_id, indices, payload
+                    video_url, sessdata, task_id, indices, payload, subtitle_fetch_enabled
                 )
             # separate 模式由 API 层处理，这里不应该到达
             # 如果到达这里，说明配置有问题，回退到普通处理
             logger.warning(f"[{self.name}] 未知的分P处理模式或无效配置: {bilibili_parts}")
 
+        if not subtitle_fetch_enabled:
+            return False
+
         logger.info(
             f"[{self.name}] 检测到 B 站 URL，尝试使用 bilibili-api 直取字幕: {video_url}"
-            f" (cookie_source={cookie_source}, has_cookie={bool(sessdata)}, subtitle_only={subtitle_only})"
+            f" (cookie_source={cookie_source}, has_cookie={bool(sessdata)})"
         )
 
         try:
             subtitle_result = self._try_extract_bilibili_subtitle(video_url, sessdata)
             if not subtitle_result:
-                logger.warning(f"[{self.name}] 未获取到可用字幕。")
-                if subtitle_only and task_id:
-                    from ..db import TaskStatus
-                    from ..task_updater import update_and_notify
-                    self._submit_coro(update_and_notify(
-                        task_id,
-                        {"status": TaskStatus.FAILED, "error_message": "未获取到可用 B 站字幕，任务已终止（当前模式不回退 ASR）。"},
-                    ))
-                    return True
-                logger.info(f"[{self.name}] 回退到下载+ASR流程。")
+                logger.info(f"[{self.name}] 未获取到可用字幕，回退到下载+ASR流程。")
                 return False
 
             transcript = subtitle_result["transcript"]
@@ -523,13 +645,21 @@ class VideoDownloaderWorker(Worker):
                 "transcript": transcript,
                 "transcription_time": 0.0,
                 "audio_duration": subtitle_result.get("duration"),
+                "summary_mode": summary_mode,
+                "summary_style": summary_style,
                 "summary_chunk_total": None,
                 "summary_chunk_done": None,
                 "summary_meta": None,
+                "transcription_meta": json.dumps(
+                    {
+                        "provider": "bilibili_subtitle",
+                        "stage": "completed",
+                        "message": "已直接获取 B 站字幕",
+                        "language": subtitle_result.get("language"),
+                    },
+                    ensure_ascii=False,
+                ),
             }
-            summary_mode = str(payload.get("summary_mode") or "").strip().lower()
-            if summary_mode in {"auto", "standard", "agent"}:
-                update_data["summary_mode"] = summary_mode
             self._submit_coro(update_and_notify(task_id, update_data))
 
             next_payload = payload.copy()
@@ -539,45 +669,33 @@ class VideoDownloaderWorker(Worker):
             })
             if self.is_task_cancelled(task_id):
                 raise TaskCancelledError(f"任务已取消，停止派发总结: {task_id}")
-            self._submit_coro(self.summary_worker.add_task(next_payload))
+            self._submit_coro(self._enqueue_summary(next_payload))
 
             logger.info(
                 f"[{self.name}] 已使用B站字幕（{subtitle_result.get('language')}），跳过音频转录。"
             )
             return True
         except Exception as e:
-            logger.warning(f"[{self.name}] B 站字幕直取失败: {e}")
-            if subtitle_only and task_id:
-                from ..db import TaskStatus
-                from ..task_updater import update_and_notify
-                self._submit_coro(update_and_notify(
-                    task_id,
-                    {"status": TaskStatus.FAILED, "error_message": f"B站字幕提取失败，任务已终止（不回退 ASR）: {e}"},
-                ))
-                return True
-            logger.warning(f"[{self.name}] 将回退 ASR。")
+            logger.warning(f"[{self.name}] B 站字幕直取失败，将回退 ASR: {e}")
             return False
 
     def _try_process_bilibili_multi_part_merge(
-        self, video_url: str, sessdata: str, task_id: str, part_indices: List[int], payload: Dict[str, Any]
+        self,
+        video_url: str,
+        sessdata: str,
+        task_id: str,
+        part_indices: List[int],
+        payload: Dict[str, Any],
+        subtitle_fetch_enabled: bool = True,
     ) -> bool:
         """
-        处理多P视频合并模式：提取所有选中分P的字幕并合并为一个转录。
+        处理多P视频合并模式：逐个分P优先取字幕，缺字幕时下载该分P音频并 ASR。
         """
         logger.info(
             f"[{self.name}] 处理多P视频合并模式: {video_url}, 分P: {[i + 1 for i in part_indices]}"
         )
 
         try:
-            # 获取视频信息和所有分P字幕
-            subtitle_results = asyncio.run(
-                self._extract_bilibili_multi_part_subtitles(video_url, sessdata, part_indices)
-            )
-
-            if not subtitle_results:
-                logger.warning(f"[{self.name}] 未能获取任何分P字幕，回退到下载+ASR流程")
-                return False
-
             # 获取视频信息用于时长计算
             from bilibili_api import Credential, video
             bvid = self._extract_bvid_from_url(video_url)
@@ -585,21 +703,44 @@ class VideoDownloaderWorker(Worker):
             video_obj = video.Video(bvid=bvid, credential=credential)
             video_info = asyncio.run(video_obj.get_info())
 
-            # 合并字幕
+            subtitle_results = self._collect_bilibili_multi_part_transcripts(
+                video_url=video_url,
+                sessdata=sessdata,
+                task_id=task_id,
+                part_indices=part_indices,
+                video_info=video_info,
+                subtitle_fetch_enabled=subtitle_fetch_enabled,
+            )
+
+            if not subtitle_results:
+                logger.warning(f"[{self.name}] 未能获取任何分P转录，回退到下载+ASR流程")
+                return False
+
+            # 合并逐P转录
             merged_transcript, total_duration = self._merge_transcripts_with_offset(
                 subtitle_results, video_info
             )
 
             if not merged_transcript.strip():
-                logger.warning(f"[{self.name}] 合并后的字幕为空，回退到下载+ASR流程")
+                logger.warning(f"[{self.name}] 合并后的分P转录为空，回退到下载+ASR流程")
                 return False
 
             # 构建标题（包含分P信息）
             title = video_info.get("title", "")
-            if len(subtitle_results) < len(part_indices):
-                title_suffix = f" (已合并 {len(subtitle_results)}/{len(part_indices)} 个分P)"
+            subtitle_count = sum(1 for item in subtitle_results if item.get("source") == "subtitle")
+            asr_count = sum(1 for item in subtitle_results if item.get("source") == "asr")
+            if len(part_indices) == 1:
+                # 单分P（拆分模式）：使用分P标题，不走合并标题逻辑
+                part_idx = part_indices[0]
+                part_title = subtitle_results[0].get("part_title") if subtitle_results else None
+                if part_title:
+                    title = f"{title} - P{part_idx + 1}: {part_title}"
+                else:
+                    title = f"{title} - P{part_idx + 1}"
+            elif len(subtitle_results) < len(part_indices):
+                title = f"{title} (已合并 {len(subtitle_results)}/{len(part_indices)} 个分P，字幕 {subtitle_count} / ASR {asr_count})"
             else:
-                title_suffix = f" (已合并 {len(part_indices)} 个分P)"
+                title = f"{title} (已合并 {len(part_indices)} 个分P，字幕 {subtitle_count} / ASR {asr_count})"
 
             intermediate_file_path = os.path.join(self.output_dir, f"{task_id}_subtitle.txt")
             output_file = os.path.join(self.output_dir, f"{task_id}_summary.md")
@@ -614,20 +755,50 @@ class VideoDownloaderWorker(Worker):
             if self.is_task_cancelled(task_id):
                 raise TaskCancelledError(f"任务已取消，停止字幕分支: {task_id}")
 
+            summary_mode = str(payload.get("summary_mode") or "standard").strip().lower()
+            if summary_mode not in {"auto", "standard", "agent"}:
+                summary_mode = "standard"
+            summary_style = str(payload.get("summary_style") or "classic").strip().lower()
+            if summary_style not in {"classic", "report"}:
+                summary_style = "classic"
+
             update_data = {
-                "title": title + title_suffix,
+                "title": title,
                 "status": TaskStatus.SUMMARIZING,
                 "progress": 0.0,
                 "transcript": merged_transcript,
                 "transcription_time": 0.0,
                 "audio_duration": total_duration,
+                "summary_mode": summary_mode,
+                "summary_style": summary_style,
                 "summary_chunk_total": None,
                 "summary_chunk_done": None,
-                "summary_meta": None,
+                "summary_meta": json.dumps({
+                    "input_type": "bilibili_multi_part",
+                    "part_total_requested": len(part_indices),
+                    "part_total_processed": len(subtitle_results),
+                    "subtitle_part_count": subtitle_count,
+                    "asr_part_count": asr_count,
+                    "part_sources": [
+                        {
+                            "part_index": item.get("part_index"),
+                            "part_title": item.get("part_title"),
+                            "source": item.get("source"),
+                        }
+                        for item in subtitle_results
+                    ],
+                }, ensure_ascii=False),
+                "transcription_meta": json.dumps(
+                    {
+                        "provider": "bilibili_multipart",
+                        "stage": "completed",
+                        "message": f"已合并 {len(subtitle_results)} 个分P转录",
+                        "subtitle_part_count": subtitle_count,
+                        "asr_part_count": asr_count,
+                    },
+                    ensure_ascii=False,
+                ),
             }
-            summary_mode = str(payload.get("summary_mode") or "").strip().lower()
-            if summary_mode in {"auto", "standard", "agent"}:
-                update_data["summary_mode"] = summary_mode
             self._submit_coro(update_and_notify(task_id, update_data))
 
             next_payload = payload.copy()
@@ -637,11 +808,11 @@ class VideoDownloaderWorker(Worker):
             })
             if self.is_task_cancelled(task_id):
                 raise TaskCancelledError(f"任务已取消，停止派发总结: {task_id}")
-            self._submit_coro(self.summary_worker.add_task(next_payload))
+            self._submit_coro(self._enqueue_summary(next_payload))
 
             logger.info(
-                f"[{self.name}] 已合并 {len(subtitle_results)} 个分P的字幕，"
-                f"总时长 {total_duration} 秒，跳过音频转录。"
+                f"[{self.name}] 已合并 {len(subtitle_results)} 个分P转录，"
+                f"字幕 {subtitle_count} 个，ASR {asr_count} 个，总时长 {total_duration} 秒。"
             )
             return True
 
@@ -698,27 +869,11 @@ class VideoDownloaderWorker(Worker):
 
             if self._try_process_with_bilibili_subtitle(payload):
                 return
-            if not self._asr_enabled():
-                if task_id:
-                    from ..db import TaskStatus
-                    from ..task_updater import update_and_notify
-                    self._submit_coro(update_and_notify(
-                        task_id,
-                        {
-                            "status": TaskStatus.FAILED,
-                            "error_message": "当前未开启模型语音识别（ASR），且未获取到可用字幕，任务已终止。",
-                        },
-                    ))
-                logger.warning(f"[{self.name}] task={task_id} 未取到字幕且 ASR 关闭，终止任务。")
-                return
         except TaskCancelledError as e:
             logger.info(f"[{self.name}] {e}")
             return
 
-        normalized_video_url = self._normalize_download_url(str(video_url))
-        logger.info(
-            f"[{self.name}] 开始下载视频: original={video_url}, normalized={normalized_video_url}, 质量={quality}"
-        )
+        logger.info(f"[{self.name}] 开始下载视频: {video_url} (质量: {quality})")
 
         if task_id:
             from ..db import TaskStatus
@@ -748,16 +903,18 @@ class VideoDownloaderWorker(Worker):
                 except ValueError:
                     logger.warning(f"[{self.name}] 无法从 yt-dlp 解析进度: '{p}' (原始值: '{raw_p}')")
 
-        cookie_path = ""
         try:
             # 配置 ffmpeg 路径（使用 FFmpegHelper）
             ffmpeg_location = FFmpegHelper.get_yt_dlp_ffmpeg_location()
-            bilibili_sessdata, cookie_source = self._resolve_bilibili_sessdata(payload)
-
+            
             if quality == "audio_only":
                 ydl_opts = {
                     'outtmpl': os.path.join(self.output_dir, '%(id)s.%(ext)s'),
-                    'format': 'worstvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/worst[ext=mp4]/best',
+                    'format': 'bestaudio/best',
+                    'postprocessors': [{
+                        'key': 'FFmpegExtractAudio',
+                        'preferredcodec': 'm4a',
+                    }],
                     'progress_hooks': [progress_hook],
                     'writethumbnail': False,
                     'writesubtitles': False,
@@ -769,34 +926,82 @@ class VideoDownloaderWorker(Worker):
                     'merge_output_format': 'mp4',
                     'progress_hooks': [progress_hook],
                 }
-
-            # 增强 B 站下载稳定性
-            ydl_opts['http_headers'] = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
-                              '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-                'Referer': 'https://www.bilibili.com/',
-                'Origin': 'https://www.bilibili.com',
-            }
-            ydl_opts['extractor_retries'] = 3
-            ydl_opts['retries'] = 3
-            ydl_opts['fragment_retries'] = 3
-            ydl_opts['sleep_interval_requests'] = 0.5
-            ydl_opts['nocheckcertificate'] = True
-            if self._is_bilibili_url(str(normalized_video_url)) and bilibili_sessdata:
-                cookie_path = self._write_temp_bilibili_cookie_file(bilibili_sessdata)
-                if cookie_path:
-                    ydl_opts['cookiefile'] = cookie_path
-                    logger.info(
-                        f"[{self.name}] 已附加 B 站登录 Cookie 到下载请求: source={cookie_source}, cookiefile={cookie_path}"
-                    )
             
             # 如果有 ffmpeg 路径，添加到配置中
             if ffmpeg_location:
                 ydl_opts['ffmpeg_location'] = ffmpeg_location
 
+            bilibili_parts = payload.get("bilibili_parts")
+            if self._is_bilibili_url(str(video_url)) and isinstance(bilibili_parts, dict):
+                indices = bilibili_parts.get("indices")
+                if isinstance(indices, list) and len(indices) == 1:
+                    try:
+                        selected_part = int(indices[0]) + 1
+                        ydl_opts["playlist_items"] = str(selected_part)
+                        logger.info(f"[{self.name}] 普通下载回退限定到 B 站分P: P{selected_part}")
+                    except (TypeError, ValueError):
+                        pass
+
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info_dict = ydl.extract_info(normalized_video_url, download=True)
+                info_dict = ydl.extract_info(video_url, download=True)
                 video_path = ydl.prepare_filename(info_dict)
+
+            # 第一步：检查原始视频路径是否存在
+            if not os.path.exists(video_path):
+                logger.info(f"[{self.name}] 原始视频路径不存在，开始尝试替换后缀查找: {video_path}")
+                base = os.path.splitext(video_path)[0]
+                logger.info(f"[{self.name}] 提取文件基础路径（无后缀）: {base}")
+                
+                # 遍历支持的后缀逐一尝试
+                for ext in ('.m4a', '.m4s', '.mp3', '.mp4', '.webm', '.opus', '.ogg', '.wav', '.flac'):
+                    candidate = base + ext
+                    logger.info(f"[{self.name}] 尝试查找候选文件: {candidate}")
+                    
+                    if os.path.exists(candidate):
+                        video_path = candidate
+                        logger.info(f"[{self.name}] 成功找到匹配后缀的文件: {video_path}")
+                        break
+                else:
+                    # 循环正常结束（未执行break），说明所有后缀都没找到
+                    logger.info(f"[{self.name}] 遍历所有支持后缀后，未找到匹配文件")
+
+            # 第二步：如果还是不存在，尝试通过ID匹配输出目录文件
+            # 分P视频文件名格式为 BV1XtRxBhEc7_p1、BV1XtRxBhEc7_p2 等
+            if not os.path.exists(video_path):
+                logger.info(f"[{self.name}] 后缀匹配失败，开始通过文件名ID匹配输出目录文件")
+                
+                filename_no_ext = os.path.splitext(os.path.basename(video_path))[0]
+                logger.info(f"[{self.name}] 提取无后缀文件名: {filename_no_ext}")
+                
+                id_match = re.search(r'(BV[A-Za-z0-9]+)', filename_no_ext)
+                if not id_match:
+                    id_match = re.search(r'([A-Za-z0-9_-]+)$', filename_no_ext)
+                
+                if id_match:
+                    video_id = id_match.group(1)
+                    logger.info(f"[{self.name}] 成功提取文件ID: {video_id}")
+                    logger.info(f"[{self.name}] 开始遍历输出目录查找匹配文件: {self.output_dir}")
+                    
+                    matched_files = []
+                    for f in os.listdir(self.output_dir):
+                        file_path = os.path.join(self.output_dir, f)
+                        if not os.path.isfile(file_path):
+                            continue
+                        name_part = os.path.splitext(f)[0]
+                        
+                        if name_part == video_id or name_part.startswith(video_id + '_p') or name_part.endswith('_' + video_id):
+                            matched_files.append(file_path)
+                            logger.info(f"[{self.name}] 匹配到文件: {file_path}")
+                    
+                    if matched_files:
+                        matched_files.sort()
+                        video_path = matched_files[0]
+                        logger.info(f"[{self.name}] 通过ID匹配成功找到文件: {video_path} (共匹配 {len(matched_files)} 个)")
+                    else:
+                        logger.info(f"[{self.name}] 遍历输出目录完成，未找到ID匹配的文件")
+                else:
+                    logger.info(f"[{self.name}] 未从文件名中匹配到有效ID，终止查找")
+
 
             logger.info(f"[{self.name}] 视频下载成功: {video_path}")
 
@@ -814,27 +1019,28 @@ class VideoDownloaderWorker(Worker):
 
                 from ..db import TaskStatus
                 from ..task_updater import update_and_notify
-                self._submit_coro(update_and_notify(task_id, {"status": TaskStatus.TRANSCRIBING}))
+                updates = {"status": TaskStatus.TRANSCRIBING}
+                video_title = info_dict.get("title")
+                if video_title:
+                    updates["title"] = str(video_title)
+                self._submit_coro(update_and_notify(task_id, updates))
 
-            next_worker = self._resolve_transcriber_worker_if_needed()
-            if next_worker:
+            if self.next_worker:
                 next_payload = payload.copy()
-                next_payload['video_file'] = video_path
                 base_name = os.path.splitext(os.path.basename(video_path))[0]
-                next_payload['audio_file'] = os.path.join(self.output_dir, f"{base_name}.mp3")
+                file_ext = os.path.splitext(video_path)[1].lower()
+                audio_exts = {'.m4a', '.m4s', '.mp3', '.wav', '.flac', '.aac', '.ogg', '.opus', '.wma'}
+                #打印参数
+                logger.info(f"当前选择质量：[{quality}]，当前文件扩展名: {file_ext}")
+                if quality == "audio_only" and file_ext in audio_exts:
+                    next_payload['video_file'] = None
+                    next_payload['audio_file'] = video_path
+                else:
+                    next_payload['video_file'] = video_path
+                    next_payload['audio_file'] = os.path.join(self.output_dir, f"{base_name}.mp3")
                 next_payload['output_file'] = os.path.join(self.output_dir, f"{base_name}_summary.md")
                 
-                self._submit_coro(next_worker.add_task(next_payload))
-            elif task_id:
-                from ..db import TaskStatus
-                from ..task_updater import update_and_notify
-                self._submit_coro(update_and_notify(
-                    task_id,
-                    {
-                        "status": TaskStatus.FAILED,
-                        "error_message": "当前未启用模型语音识别（ASR），无法继续音频转录流程。",
-                    },
-                ))
+                self._submit_coro(self.next_worker.add_task(next_payload))
 
         except TaskCancelledError as e:
             logger.info(f"[{self.name}] {e}")
@@ -845,15 +1051,4 @@ class VideoDownloaderWorker(Worker):
                 from ..task_updater import update_and_notify
                 # 清理错误信息中的 ANSI 转义序列
                 clean_error = re.sub(r'\x1B(?:[@-Z\-_]|\[[0-?]*[ -/]*[@-~])', '', str(e))
-                if "HTTP Error 412" in clean_error:
-                    clean_error = (
-                        "B站下载触发 412（风控拦截）。请在“转录设置”中填写有效 SESSDATA，"
-                        "或切换为仅字幕总结模式。原始错误: " + clean_error
-                    )
                 self._submit_coro(update_and_notify(task_id, {"status": TaskStatus.FAILED, "error_message": clean_error}))
-        finally:
-            if cookie_path and os.path.exists(cookie_path):
-                try:
-                    os.remove(cookie_path)
-                except OSError:
-                    pass

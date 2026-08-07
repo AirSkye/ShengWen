@@ -62,3 +62,51 @@ export const stripDoubleBracePlaceholders = (text: string) => {
     .replace(/<p>\s*<\/p>/g, '')
     .trim()
 }
+
+export const stripSummaryPresentationMarkers = (text: string) => {
+  if (!text) return ''
+  const cleanedLines: string[] = []
+  let insidePresentationBlock = false
+
+  for (const line of text.replace(/\r\n?/g, '\n').split('\n')) {
+    const calloutMarker = line.match(
+      /^\s*>\s*\[![A-Z][A-Z0-9_-]{0,31}\]\s*(.*)$/i,
+    )
+    if (calloutMarker) {
+      insidePresentationBlock = true
+      const inlineContent = (calloutMarker[1] || '').trim()
+      if (inlineContent) cleanedLines.push(inlineContent)
+      continue
+    }
+
+    if (insidePresentationBlock) {
+      const quotedLine = line.match(/^\s*>\s?(.*)$/)
+      if (quotedLine) {
+        cleanedLines.push(quotedLine[1] || '')
+        continue
+      }
+      insidePresentationBlock = false
+    }
+
+    const plainMarker = line.match(
+      /^\s*\[![A-Z][A-Z0-9_-]{0,31}\]\s*(.*)$/i,
+    )
+    if (plainMarker) {
+      const inlineContent = (plainMarker[1] || '').trim()
+      if (inlineContent) cleanedLines.push(inlineContent)
+      continue
+    }
+
+    if (/^\s*<!--\s*sw:[a-z][a-z0-9_-]{0,31}\s*-->\s*$/i.test(line)) {
+      continue
+    }
+    cleanedLines.push(line)
+  }
+
+  return cleanedLines.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+export const isLinkableSource = (value?: string | null) => {
+  const source = (value || '').trim()
+  return /^https?:\/\//i.test(source) || /^file:\/\//i.test(source)
+}

@@ -8,6 +8,7 @@ import {
   formatDateTime,
   countWords,
   stripDoubleBracePlaceholders,
+  stripSummaryPresentationMarkers,
 } from '../utils/formatters'
 import { getCurrentTheme, type MarkdownTheme } from './useMarkdownTheme'
 import { normalizeAccidentalInlineCodeBlocks } from '../utils/markdownNormalizer'
@@ -22,6 +23,7 @@ export interface SummaryImageExportPayload {
   topic: string
   compiledMarkdown: string
   rawSummary: string
+  beautifySummary?: boolean
   shareUrl?: string
 }
 
@@ -140,6 +142,7 @@ const createRenderSignature = (
     compiledMarkdown.length,
     hashText(rawSummary),
     rawSummary.length,
+    payload.beautifySummary ? 'beautified' : 'classic',
     settings.width,
     settings.layoutPreset,
     settings.metaMode,
@@ -354,14 +357,17 @@ const applySummaryTypography = (
   cleanedCompiledMarkdown: string,
   theme: MarkdownTheme,
   settings: SummaryImageExportSettings,
+  beautifySummary: boolean,
 ) => {
-  summaryContent.className = 'prose prose-slate max-w-none ss-shared-prose markdown-theme-container ss-export-mode'
+  summaryContent.className = beautifySummary
+    ? 'prose prose-slate max-w-none ss-shared-prose markdown-theme-container ss-report-layout ss-export-mode'
+    : 'prose prose-slate max-w-none ss-shared-prose markdown-theme-container ss-export-mode'
   summaryContent.style.maxWidth = '100%'
   summaryContent.innerHTML = cleanedCompiledMarkdown || '<p>暂无总结内容</p>'
 
   restoreTimestampChipsToText(summaryContent)
 
-  applySummaryTypographyStyles(summaryContent, theme, settings)
+  applySummaryTypographyStyles(summaryContent, theme, settings, beautifySummary)
 
   const exportConfig = theme.exportConfig
   const baseFontSize = (exportConfig?.fontSize || SUMMARY_FONT_SIZE) * settings.fontScale
@@ -372,8 +378,11 @@ const applySummaryTypographyStyles = (
   summaryContent: HTMLElement,
   theme: MarkdownTheme,
   settings: SummaryImageExportSettings,
+  beautifySummary = summaryContent.classList.contains('ss-report-layout'),
 ) => {
-  summaryContent.className = 'prose prose-slate max-w-none ss-shared-prose markdown-theme-container ss-export-mode'
+  summaryContent.className = beautifySummary
+    ? 'prose prose-slate max-w-none ss-shared-prose markdown-theme-container ss-report-layout ss-export-mode'
+    : 'prose prose-slate max-w-none ss-shared-prose markdown-theme-container ss-export-mode'
 
   const exportConfig = theme.exportConfig
   const baseFontSize = (exportConfig?.fontSize || SUMMARY_FONT_SIZE) * settings.fontScale
@@ -443,7 +452,10 @@ const createPageCard = (
   includeMeta: boolean,
 ): RenderPageContext => {
   const shareUrl = payload.shareUrl || DEFAULT_SHARE_URL
-  const cleanedRawSummary = stripDoubleBracePlaceholders(payload.rawSummary || '')
+  const rawSummary = payload.beautifySummary
+    ? payload.rawSummary || ''
+    : stripSummaryPresentationMarkers(payload.rawSummary || '')
+  const cleanedRawSummary = stripDoubleBracePlaceholders(rawSummary)
   const scalePx = createScalePx(settings.fontScale)
 
   const headerHorizontalPadding = Math.round(HEADER_HORIZONTAL_PADDING * settings.contentPaddingScale)
@@ -564,7 +576,9 @@ const createPageCard = (
   contentWrap.style.color = theme.cssVariables['--md-text-color'] || '#334155'
 
   const summaryContent = document.createElement('article')
-  summaryContent.className = 'prose prose-slate max-w-none ss-shared-prose markdown-theme-container ss-export-mode'
+  summaryContent.className = payload.beautifySummary
+    ? 'prose prose-slate max-w-none ss-shared-prose markdown-theme-container ss-report-layout ss-export-mode'
+    : 'prose prose-slate max-w-none ss-shared-prose markdown-theme-container ss-export-mode'
   contentWrap.appendChild(summaryContent)
 
   const footer = document.createElement('div')
@@ -771,9 +785,9 @@ const cloneSummaryBlocks = async (
 ): Promise<HTMLElement[]> => {
   const source = document.createElement('article')
   const cleanedCompiledMarkdown = stripDoubleBracePlaceholders(payload.compiledMarkdown || '')
-  applySummaryTypography(source, cleanedCompiledMarkdown, theme, settings)
+  applySummaryTypography(source, cleanedCompiledMarkdown, theme, settings, Boolean(payload.beautifySummary))
   await renderMermaidInNode(source, resolveMermaidFontSizePx(theme, settings))
-  applySummaryTypographyStyles(source, theme, settings)
+  applySummaryTypographyStyles(source, theme, settings, Boolean(payload.beautifySummary))
   normalizeExportListMarkers(source)
   normalizeExportQuoteBaseline(source)
 

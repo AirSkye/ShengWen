@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { PhPencilSimple, PhCheck, PhX, PhArrowSquareOut } from '@phosphor-icons/vue'
 import type { Task } from '../types'
-import { formatDuration, formatTranscriptionDuration, formatConversionRatio, formatDateTime } from '../utils/formatters'
+import { formatDuration, formatTranscriptionDuration, formatConversionRatio, formatDateTime, isLinkableSource } from '../utils/formatters'
 import { ref, nextTick } from 'vue'
 
 const props = defineProps<{
@@ -31,21 +31,25 @@ const startEditingTopic = () => {
 
 <template>
   <div class="flex flex-col gap-4">
-    <!-- 主题标题 -->
-    <div v-if="!isEditingTopic" class="flex items-center gap-2">
-      <h1 class="text-2xl md:text-3xl font-bold text-slate-800">
-        {{ topic || task.title || 'AI 总结' }}
-      </h1>
+    <!-- 视频标题 -->
+    <h1 class="text-2xl md:text-3xl font-bold text-slate-800">
+      {{ task.title || '未命名视频' }}
+    </h1>
+    <!-- AI要点总结（副标题，可编辑） -->
+    <div v-if="!isEditingTopic" class="flex items-center gap-2 -mt-2">
+      <p v-if="topic" class="text-sm text-slate-500">{{ topic }}</p>
       <button
         @click="startEditingTopic"
-        class="inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-gray-200 bg-white text-slate-400 hover:text-primary hover:border-blue-200 hover:bg-blue-50 transition-colors"
-        title="编辑主题"
+        class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border border-gray-200 bg-white text-slate-400 hover:text-primary hover:border-blue-200 hover:bg-blue-50 transition-colors text-xs"
+        title="编辑要点总结"
       >
-        <PhPencilSimple :size="18" />
-        <span class="text-xs font-medium">编辑</span>
+        <PhPencilSimple :size="14" />
+        <span>编辑要点</span>
       </button>
     </div>
-    <div v-else class="flex items-center gap-2">
+    <p v-if="!topic && !isEditingTopic" class="text-sm text-slate-400 -mt-2">暂无要点总结，点击上方按钮添加</p>
+    <!-- 编辑状态 -->
+    <div v-if="isEditingTopic" class="flex items-center gap-2 -mt-2">
       <input
         ref="inputRef"
         :value="editingTopicValue"
@@ -54,7 +58,7 @@ const startEditingTopic = () => {
         @input="$emit('update:editing-topic-value', ($event.target as HTMLInputElement).value)"
         @keyup.enter="$emit('save-topic')"
         @keyup.esc="$emit('cancel-edit-topic')"
-        placeholder="输入主题..."
+        placeholder="输入要点总结..."
       />
       <button @click="$emit('save-topic')" class="text-emerald-600 hover:bg-emerald-50 p-2 rounded-lg" title="保存">
         <PhCheck :size="20" />
@@ -67,10 +71,11 @@ const startEditingTopic = () => {
     <!-- 视频链接 -->
     <div class="flex items-center gap-2 text-xs text-slate-500">
       <span class="text-slate-400">视频链接:</span>
-      <a :href="task.video_url" target="_blank" class="text-slate-600 hover:text-primary hover:underline truncate flex items-center gap-1 max-w-md">
+      <a v-if="isLinkableSource(task.video_url)" :href="task.video_url" target="_blank" class="text-slate-600 hover:text-primary hover:underline truncate flex items-center gap-1 max-w-md">
         {{ task.video_url }}
         <PhArrowSquareOut :size="12" />
       </a>
+      <span v-else class="text-slate-600 truncate max-w-md">{{ task.video_url }}</span>
       <template v-if="task.author_name">
         <span class="text-slate-400">By</span>
         <a
@@ -114,7 +119,7 @@ const startEditingTopic = () => {
               task.summary_mode === 'agent'
                 ? 'Agent 增强模式'
                 : task.summary_mode === 'standard'
-                  ? '标准模式'
+                  ? '通用模式'
                   : '自动模式'
             }}
           </strong>

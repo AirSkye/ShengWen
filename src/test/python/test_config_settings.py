@@ -11,6 +11,18 @@ from src.main.python.sheng_wen.config.settings import JSONConfigManager
 
 
 class TestJSONConfigManager(unittest.TestCase):
+    def test_defaults_enable_tingwu_without_local_fallback(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = os.path.join(temp_dir, "settings.json")
+            manager = JSONConfigManager(config_path=config_path)
+
+            tingwu = manager.get_tingwu_config()
+            summarization = manager.get_summarization_config()
+
+            self.assertTrue(tingwu.enabled)
+            self.assertFalse(tingwu.fallback_to_whisper)
+            self.assertEqual(summarization.mode, "standard")
+
     def test_switch_to_auto_download_clears_manual_model_paths(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = os.path.join(temp_dir, "settings.json")

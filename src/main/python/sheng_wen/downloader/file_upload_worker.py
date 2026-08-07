@@ -1,4 +1,3 @@
-import asyncio
 import os
 from typing import Any
 
@@ -25,10 +24,10 @@ class FileUploadWorker(Worker):
     # 文件大小限制 (500MB)
     MAX_FILE_SIZE = 500 * 1024 * 1024
 
-    def __init__(self, name: str, next_worker: Worker = None):
+    def __init__(self, name: str, next_worker: Worker = None, output_dir: str = "temp"):
         super().__init__(name)
         self.next_worker = next_worker
-        self.output_dir = "temp"
+        self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
 
     async def process_task(self, payload: Any):
@@ -53,7 +52,7 @@ class FileUploadWorker(Worker):
         if task_id:
             from ..db import TaskStatus
             from ..task_updater import update_and_notify
-            await update_and_notify(task_id, {"status": TaskStatus.UPLOADING, "progress": 0.0})
+            await update_and_notify(task_id, {"status": TaskStatus.UPLOADING})
 
         try:
             # 获取文件大小
@@ -75,16 +74,6 @@ class FileUploadWorker(Worker):
                 if task_id:
                     await self._mark_task_failed(task_id, error_msg)
                 return
-
-            # 模拟上传进度 (从 0% 到 100%)
-            # 在实际场景中，文件已经被 FastAPI 保存，这里只是模拟进度反馈
-            upload_steps = 10
-            for i in range(1, upload_steps + 1):
-                progress = (i / upload_steps) * 100
-                if task_id:
-                    from ..api import notify_progress_update
-                    await notify_progress_update(task_id, progress)
-                await asyncio.sleep(0.05)  # 轻微延迟，让前端能看到进度
 
             # 确定最终文件路径
             final_path = os.path.join(self.output_dir, f"{task_id}{file_ext}")
@@ -112,6 +101,7 @@ class FileUploadWorker(Worker):
                     media_path=final_path,
                     output_dir=self.output_dir,
                     summary_mode=str(payload.get("summary_mode") or ""),
+                    summary_style=str(payload.get("summary_style") or "classic"),
                 )
                 await self.next_worker.add_task(next_payload)
 

@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Callable, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import importlib
 
 # --- 自定义异常 ---
@@ -36,6 +36,8 @@ class TranscriptionResult:
     audio_duration: float           # 音频总时长（秒）
     language: str                   # 检测到的语言代码 (例如, "zh")
     language_probability: float     # 语言检测的置信度 (0-1)
+    provider: str = "fast_whisper"
+    artifacts: Dict[str, Any] = field(default_factory=dict)
 
 # --- 抽象基类 ---
 

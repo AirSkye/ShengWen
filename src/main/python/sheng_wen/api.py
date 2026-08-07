@@ -4,9 +4,11 @@ import json
 import glob
 import ipaddress
 import re
+import yt_dlp
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Request
 from fastapi import Form
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, HttpUrl
@@ -34,6 +36,7 @@ from .downloader.bilibili_author_resolver import (
 app = FastAPI(title="ShengWen API", description="视频转录与 AI 总结服务", version=APP_VERSION)
 
 VALID_SUMMARY_MODES = {"auto", "standard", "agent"}
+VALID_SUMMARY_STYLES = {"classic", "report"}
 
 
 def _build_model_load_error_detail(error: ModelLoadError) -> str:
@@ -98,12 +101,12 @@ if os.path.exists(dist_dir):
 
 class TaskCreate(BaseModel):
     video_url: HttpUrl
-    quality: Optional[str] = "best" # "best", "audio_only"
-    title: Optional[str] = Field(default=None, description="任务标题（用户输入）")
+    quality: Optional[str] = "audio_only" # "best", "audio_only"
     summary_mode: Optional[str] = Field(
         default=None,
-        description="总结模式: standard | agent | auto（前端建议仅 standard/agent）",
+        description="处理模式: standard | agent | auto",
     )
+    summary_style: Optional[str] = Field(default=None, description="总结呈现: classic | report")
     bilibili_sessdata: Optional[str] = Field(
         default=None,
         description="任务级 B 站 SESSDATA，可覆盖全局配置与环境变量",
@@ -111,11 +114,21 @@ class TaskCreate(BaseModel):
 
 class LocalPathTaskCreate(BaseModel):
     file_path: str = Field(..., min_length=1, description="本机文件绝对路径")
-    title: Optional[str] = Field(default=None, description="任务标题（用户输入）")
     summary_mode: Optional[str] = Field(
         default=None,
-        description="总结模式: standard | agent | auto（前端建议仅 standard/agent）",
+        description="处理模式: standard | agent | auto",
     )
+    summary_style: Optional[str] = Field(default=None, description="总结呈现: classic | report")
+
+class RawTextTaskCreate(BaseModel):
+    text: str = Field(..., min_length=1, description="Raw transcript text without timestamps")
+    title: Optional[str] = Field(default=None, description="Optional task title")
+    summary_mode: Optional[str] = Field(
+        default=None,
+        description="Summary mode: standard | agent | auto",
+    )
+    summary_style: Optional[str] = Field(default=None, description="总结呈现: classic | report")
+
 
 class TaskUpdate(BaseModel):
     topic: Optional[str] = None
@@ -137,9 +150,34 @@ class Task(BaseModel):
     author_name: Optional[str] = None
     author_url: Optional[str] = None
     summary_mode: Optional[str] = None
+    summary_style: Optional[str] = "classic"
     summary_chunk_total: Optional[int] = None
     summary_chunk_done: Optional[int] = None
     summary_meta: Optional[str] = None
+    transcription_meta: Optional[str] = None
+    folder_id: Optional[str] = None
+
+
+class FolderCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=200)
+    parent_id: Optional[str] = Field(default=None, description="父文件夹ID，NULL为顶层")
+
+class FolderUpdate(BaseModel):
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    parent_id: Optional[str] = Field(default=None, description="移动到新父文件夹")
+    sort_order: Optional[int] = None
+
+class TaskFolderAssign(BaseModel):
+    folder_id: Optional[str] = Field(default=None, description="分配到文件夹，NULL为取消分配")
+
+class Folder(BaseModel):
+    id: str
+    name: str
+    parent_id: Optional[str] = None
+    folder_type: str = "manual"
+    source_video_url: Optional[str] = None
+    sort_order: int = 0
+    created_at: Optional[datetime] = None
 
 
 class ReSummarizeRequest(BaseModel):
@@ -147,13 +185,15 @@ class ReSummarizeRequest(BaseModel):
         default=None,
         description="重新总结时指定模式: standard | agent | auto",
     )
+    summary_style: Optional[str] = Field(default=None, description="重新总结呈现: classic | report")
 
 
 class ReTranscribeRequest(BaseModel):
     summary_mode: Optional[str] = Field(
         default=None,
-        description="重新转录后进入总结时指定模式: standard | agent | auto",
+        description="重新转录后处理模式: standard | agent | auto",
     )
+    summary_style: Optional[str] = Field(default=None, description="重新转录后总结呈现: classic | report")
 
 
 class LLMProviderInfo(BaseModel):
@@ -164,7 +204,9 @@ class LLMProviderInfo(BaseModel):
     description: str
 
 
-class LLMSettings(BaseModel):
+class LLMProfileInfo(BaseModel):
+    id: str
+    name: str
     provider: str
     base_url: str
     model_id: str
@@ -174,8 +216,24 @@ class LLMSettings(BaseModel):
     api_key_hint: str
 
 
-class LLMSettingsUpdate(BaseModel):
-    provider: str
+class LLMProfilesSettings(BaseModel):
+    active_profile_id: str
+    profiles: List[LLMProfileInfo]
+
+
+class LLMProfileCreate(BaseModel):
+    name: str = Field(..., description="Profile 名称")
+    provider: str = Field(..., description="供应商类型")
+    base_url: Optional[str] = None
+    api_key: Optional[str] = Field(default=None, description="API Key（可选）")
+    model_id: Optional[str] = None
+    temperature: Optional[float] = Field(default=None, ge=0.0, le=2.0)
+
+
+class LLMProfileUpdate(BaseModel):
+    profile_id: str = Field(..., description="要更新的 Profile ID")
+    name: Optional[str] = None
+    provider: Optional[str] = None
     base_url: Optional[str] = None
     api_key: Optional[str] = Field(default=None, description="不传则保持当前密钥")
     model_id: Optional[str] = None
@@ -183,7 +241,19 @@ class LLMSettingsUpdate(BaseModel):
     context_window_size: Optional[int] = Field(default=None, ge=1)
 
 
+class LLMActiveProfileUpdate(BaseModel):
+    profile_id: str
+
+
 class TranscriptionSettings(BaseModel):
+    transcription_provider: str
+    tingwu_enabled: bool
+    tingwu_config_path: str
+    tingwu_config_resolved: str
+    tingwu_configured: bool
+    tingwu_poll_interval_sec: float
+    tingwu_timeout_sec: float
+    tingwu_fallback_to_whisper: bool
     device: str
     model_source: str
     model_size: str
@@ -202,13 +272,20 @@ class TranscriptionSettings(BaseModel):
     cuda_reason: str
     cuda_message: str
     enable_bilibili_subtitle_fetch: bool
-    enable_asr_transcription: bool
     has_bilibili_sessdata: bool
     bilibili_cookie_source: str
     bilibili_sessdata_masked: str
 
 
 class TranscriptionSettingsUpdate(BaseModel):
+    tingwu_enabled: Optional[bool] = Field(default=None, description="是否优先使用通义听悟")
+    tingwu_config_path: Optional[str] = Field(default=None, description="听悟认证配置文件路径")
+    tingwu_poll_interval_sec: Optional[float] = Field(default=None, ge=1.0, description="听悟轮询间隔")
+    tingwu_timeout_sec: Optional[float] = Field(default=None, ge=60.0, description="听悟任务超时")
+    tingwu_fallback_to_whisper: Optional[bool] = Field(
+        default=None,
+        description="听悟失败后是否加载本地 Whisper 回退",
+    )
     device: Optional[str] = Field(default=None, description="cpu 或 cuda")
     model_source: Optional[str] = Field(default=None, description="auto_download 或 manual_path")
     model_size: Optional[str] = Field(default=None, description="tiny/base/small/medium/large")
@@ -216,10 +293,6 @@ class TranscriptionSettingsUpdate(BaseModel):
     enable_bilibili_subtitle_fetch: Optional[bool] = Field(
         default=None,
         description="是否优先尝试直取 B 站字幕（失败时回退 ASR）"
-    )
-    enable_asr_transcription: Optional[bool] = Field(
-        default=None,
-        description="是否允许回退到模型语音识别（ASR）。关闭后仅允许字幕来源。",
     )
     bilibili_sessdata: Optional[str] = Field(
         default=None,
@@ -229,6 +302,10 @@ class TranscriptionSettingsUpdate(BaseModel):
         default=None,
         description="是否清空当前保存的全局 B 站 SESSDATA",
     )
+
+
+class TingwuSessionUpdate(BaseModel):
+    session: str = Field(..., min_length=1, description="完整的听悟 Cookie/Session 字符串")
 
 
 class BilibiliCookieFromBrowserResult(BaseModel):
@@ -266,11 +343,11 @@ class BilibiliPartsConfig(BaseModel):
 class TaskCreate(BaseModel):
     video_url: HttpUrl
     quality: Optional[str] = "best" # "best", "audio_only"
-    title: Optional[str] = Field(default=None, description="任务标题（用户输入）")
     summary_mode: Optional[str] = Field(
         default=None,
-        description="总结模式: standard | agent | auto（前端建议仅 standard/agent）",
+        description="处理模式: standard | agent | auto",
     )
+    summary_style: Optional[str] = Field(default=None, description="总结呈现: classic | report")
     bilibili_sessdata: Optional[str] = Field(
         default=None,
         description="任务级 B 站 SESSDATA，可覆盖全局配置与环境变量",
@@ -285,12 +362,14 @@ class SummarizationSettings(BaseModel):
     mode: str
     auto_chunk_min_audio_duration_sec: int
     auto_chunk_min_transcript_lines: int
+    auto_chunk_min_plain_text_chars: int
     chunk_target_duration_sec: int
     chunk_min_duration_sec: int
     chunk_max_duration_sec: int
     boundary_jump_sec: int
     prev_tail_timestamp_lines_m: int
     prev_summary_tail_chars_j: int
+    summary_detail_level: int
     llm_call_retry_max: int
     max_agent_value_chars: int
     fallback_to_standard_on_agent_error: bool
@@ -300,12 +379,14 @@ class SummarizationSettingsUpdate(BaseModel):
     mode: Optional[str] = Field(default=None, description="auto | standard | agent")
     auto_chunk_min_audio_duration_sec: Optional[int] = Field(default=None, ge=300)
     auto_chunk_min_transcript_lines: Optional[int] = Field(default=None, ge=100)
+    auto_chunk_min_plain_text_chars: Optional[int] = Field(default=None, ge=1000)
     chunk_target_duration_sec: Optional[int] = Field(default=None, ge=60)
     chunk_min_duration_sec: Optional[int] = Field(default=None, ge=30)
     chunk_max_duration_sec: Optional[int] = Field(default=None, ge=60)
     boundary_jump_sec: Optional[int] = Field(default=None, ge=1)
     prev_tail_timestamp_lines_m: Optional[int] = Field(default=None, ge=0)
     prev_summary_tail_chars_j: Optional[int] = Field(default=None, ge=0)
+    summary_detail_level: Optional[int] = Field(default=None, ge=1, le=5)
     llm_call_retry_max: Optional[int] = Field(default=None, ge=1)
     max_agent_value_chars: Optional[int] = Field(default=None, ge=100)
     fallback_to_standard_on_agent_error: Optional[bool] = None
@@ -412,12 +493,23 @@ initial_llm_config = LLMConfig(
 )
 initial_provider_id = llm_cfg.provider.strip() if llm_cfg.provider.strip() else None
 
+llm_provider_manager = LLMProviderManager(
+    initial_config=initial_llm_config,
+    initial_provider_id=initial_provider_id,
+)
+# Load all profiles from settings.json into the manager
+llm_profiles_config = config_manager.get_llm_profiles_config()
+llm_provider_manager.load_profiles(
+    [{"id": p.id, "name": p.name, "provider": p.provider, "base_url": p.base_url, "api_key": p.api_key, "model_id": p.model_id, "temperature": p.temperature, "context_window_size": p.context_window_size} for p in llm_profiles_config.profiles],
+    llm_profiles_config.active_profile_id,
+)
+
 whisper_cfg = config.whisper
+tingwu_cfg = config.tingwu
 initial_transcription_device = str(whisper_cfg.device).lower()
 if initial_transcription_device not in {"cpu", "cuda"}:
     initial_transcription_device = "cpu"
 initial_enable_bilibili_subtitle_fetch = bool(whisper_cfg.enable_bilibili_subtitle_fetch)
-initial_enable_asr_transcription = bool(getattr(whisper_cfg, "enable_asr_transcription", False))
 initial_bilibili_sessdata = str(whisper_cfg.bilibili_sessdata or "")
 
 transcription_settings_manager = TranscriptionSettingsManager(
@@ -426,12 +518,13 @@ transcription_settings_manager = TranscriptionSettingsManager(
     model_size=whisper_cfg.model_size,
     model_path=whisper_cfg.configured_model_path,
     initial_enable_bilibili_subtitle_fetch=initial_enable_bilibili_subtitle_fetch,
-    initial_enable_asr_transcription=initial_enable_asr_transcription,
     initial_bilibili_sessdata=initial_bilibili_sessdata,
-)
-llm_provider_manager = LLMProviderManager(
-    initial_config=initial_llm_config,
-    initial_provider_id=initial_provider_id,
+    initial_tingwu_enabled=tingwu_cfg.enabled,
+    initial_tingwu_config_path=tingwu_cfg.config_path,
+    initial_tingwu_poll_interval_sec=tingwu_cfg.poll_interval_sec,
+    initial_tingwu_timeout_sec=tingwu_cfg.timeout_sec,
+    initial_tingwu_fallback_to_whisper=tingwu_cfg.fallback_to_whisper,
+    temp_dir=config.app.temp_dir,
 )
 
 
@@ -460,27 +553,23 @@ async def get_transcriber_worker():
     global transcriber_worker
     if transcriber_worker is not None:
         return transcriber_worker
-    if not _is_asr_transcription_enabled():
-        raise ModelLoadError("当前未开启模型语音识别（ASR），请在转录设置中手动开启后再使用音频转录。")
 
-    from .transcriber.transcriber import get_transcriber
     from .transcriber.transcriber_worker import TranscriberWorker
 
     runtime_transcription_state = transcription_settings_manager.get_runtime_state()
-    transcriber_config = transcription_settings_manager.build_transcriber_kwargs()
-    model_source = str(runtime_transcription_state.get("model_source") or "auto_download")
-
-    if model_source == "manual_path":
-        logger.info(f"[Transcriber] 使用本地模型路径: {transcriber_config.get('model_size_or_path')}")
+    if bool(runtime_transcription_state.get("tingwu_enabled")):
+        logger.info(
+            "[Transcriber] 默认使用通义听悟，"
+            f"fallback_to_whisper={bool(runtime_transcription_state.get('tingwu_fallback_to_whisper'))}"
+        )
     else:
-        logger.info(f"[Transcriber] 使用模型大小: {transcriber_config.get('model_size')}")
+        logger.info("[Transcriber] 使用本地 Fast-Whisper 转录。")
 
-    transcriber = get_transcriber("fast_whisper", **transcriber_config)
-    llm_w = await get_llm_worker()
+    transcriber = transcription_settings_manager.build_active_transcriber()
     transcriber_worker = TranscriberWorker(
         name="TranscriberWorker",
         transcriber=transcriber,
-        next_worker=llm_w
+        next_worker_factory=get_llm_worker,
     )
     transcription_settings_manager.bind_transcriber_worker(transcriber_worker)
     transcriber_worker.start()
@@ -495,14 +584,13 @@ async def get_downloader_worker():
 
     from .downloader.video_downloader_worker import VideoDownloaderWorker
 
-    llm_w = await get_llm_worker()
-
+    transcriber_w = await get_transcriber_worker()
     downloader_worker = VideoDownloaderWorker(
         name="VideoDownloaderWorker",
-        next_worker=None,
-        transcriber_worker_factory=get_transcriber_worker,
-        summary_worker=llm_w,
+        next_worker=transcriber_w,
+        summary_worker_factory=get_llm_worker,
         transcription_settings_manager=transcription_settings_manager,
+        output_dir=config.app.temp_dir,
     )
     downloader_worker.start()
     return downloader_worker
@@ -520,7 +608,8 @@ async def get_file_upload_worker():
 
     file_upload_worker = FileUploadWorker(
         name="FileUploadWorker",
-        next_worker=transcriber_w
+        next_worker=transcriber_w,
+        output_dir=config.app.temp_dir,
     )
     file_upload_worker.start()
     return file_upload_worker
@@ -584,10 +673,10 @@ def _sanitize_cookie_value(value: str | None) -> str:
 
 
 def _resolve_default_summary_mode() -> str:
-    configured = str(config.summarization.mode or "auto").strip().lower()
+    configured = str(config.summarization.mode or "standard").strip().lower()
     if configured in VALID_SUMMARY_MODES:
         return configured
-    return "auto"
+    return "standard"
 
 
 def _normalize_summary_mode(raw_value: str | None, fallback: str | None = None) -> str:
@@ -600,65 +689,14 @@ def _normalize_summary_mode(raw_value: str | None, fallback: str | None = None) 
     return _resolve_default_summary_mode()
 
 
-def _is_asr_transcription_enabled() -> bool:
-    try:
-        settings = transcription_settings_manager.get_settings()
-        return bool(settings.get("enable_asr_transcription", False))
-    except Exception:
-        return False
-
-
-def _normalize_task_title(title: str | None, fallback: str) -> str:
-    normalized = str(title or "").strip()
-    return normalized or fallback
-
-
-def _normalize_subtitle_text(raw_text: str, source_name: str) -> str:
-    text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
-    logger.info(f"[SubtitleUpload] 开始标准化字幕文本: source={source_name}, raw_chars={len(text)}")
-    lines = text.split("\n")
-
-    normalized_lines: list[str] = []
-    synthetic_index = 0
-    for raw_line in lines:
-        line = str(raw_line or "").strip()
-        if not line:
-            continue
-        if re.match(r"^\d+$", line):
-            continue
-        if "-->" in line:
-            continue
-
-        pure_text = line
-        match = re.match(r"^(?:\[(\d{1,2}:\d{2}(?::\d{2})?)\]|(\d{1,2}:\d{2}(?::\d{2})?))[ \t\-:：]*(.*)$", line)
-        if match:
-            ts = match.group(1) or match.group(2) or ""
-            pure_text = (match.group(3) or "").strip()
-            if pure_text:
-                parts = [int(p) for p in ts.split(":")]
-                if len(parts) == 2:
-                    seconds = parts[0] * 60 + parts[1]
-                else:
-                    seconds = parts[0] * 3600 + parts[1] * 60 + parts[2]
-                hh = int(seconds // 3600)
-                mm = int((seconds % 3600) // 60)
-                ss = int(seconds % 60)
-                normalized_lines.append(f"{hh:02d}{mm:02d}{ss:02d}{pure_text}")
-                continue
-
-        if pure_text:
-            seconds = synthetic_index * 3
-            synthetic_index += 1
-            hh = int(seconds // 3600)
-            mm = int((seconds % 3600) // 60)
-            ss = int(seconds % 60)
-            normalized_lines.append(f"{hh:02d}{mm:02d}{ss:02d}{pure_text}")
-
-    result = "\n".join(normalized_lines).strip()
-    logger.info(
-        f"[SubtitleUpload] 字幕标准化完成: source={source_name}, lines={len(normalized_lines)}, result_chars={len(result)}"
-    )
-    return result
+def _normalize_summary_style(raw_value: str | None, fallback: str | None = None) -> str:
+    candidate = str(raw_value or "").strip().lower()
+    if candidate in VALID_SUMMARY_STYLES:
+        return candidate
+    fb = str(fallback or "").strip().lower()
+    if fb in VALID_SUMMARY_STYLES:
+        return fb
+    return "classic"
 
 
 async def _try_resolve_and_persist_author(task_id: str, video_url: str) -> bool:
@@ -731,13 +769,14 @@ def _resolve_local_media_file(task_id: str, task: dict) -> str | None:
             return candidate
 
     # 2) 尝试上传任务的惯例命名：temp/{task_id}.<ext>
+    temp_dir = config.app.temp_dir
     for ext in SUPPORTED_MEDIA_EXTENSIONS:
-        candidate = os.path.join("temp", f"{task_id}{ext}")
+        candidate = os.path.join(temp_dir, f"{task_id}{ext}")
         if os.path.exists(candidate):
             return candidate
 
     # 3) 兜底扫描：temp/{task_id}.*
-    for path in glob.glob(os.path.join("temp", f"{task_id}.*")):
+    for path in glob.glob(os.path.join(temp_dir, f"{task_id}.*")):
         ext = os.path.splitext(path)[1].lower()
         if ext in SUPPORTED_MEDIA_EXTENSIONS and os.path.exists(path):
             return path
@@ -748,14 +787,11 @@ def _resolve_local_media_file(task_id: str, task: dict) -> str | None:
 async def upload_file(
     file: UploadFile = File(...),
     summary_mode: Optional[str] = Form(default=None),
-    title: Optional[str] = Form(default=None),
+    summary_style: Optional[str] = Form(default=None),
 ):
     """
     接收上传的视频/音频文件
     """
-    if not _is_asr_transcription_enabled():
-        raise HTTPException(status_code=400, detail="当前未开启模型语音识别（ASR），仅支持字幕来源任务。")
-
     # 验证文件类型
     file_ext = os.path.splitext(file.filename)[1].lower() if file.filename else ''
 
@@ -769,49 +805,101 @@ async def upload_file(
     task_id = str(uuid.uuid4())
 
     # 保存上传的文件到临时目录
-    temp_dir = "temp"
+    temp_dir = config.app.temp_dir
     os.makedirs(temp_dir, exist_ok=True)
 
     # 临时保存路径（在 FileUploadWorker 处理后会重命名）
     temp_file_path = os.path.join(temp_dir, f"{task_id}_temp{file_ext}")
 
+    resolved_summary_mode = _normalize_summary_mode(summary_mode)
+    resolved_summary_style = _normalize_summary_style(summary_style)
+    task_data = {
+        "id": task_id,
+        "video_url": f"file://{temp_file_path}",
+        "status": TaskStatus.UPLOADING,
+        "created_at": datetime.utcnow(),
+        "latest_modified_at": datetime.utcnow(),
+        "progress": 0.0,
+        "title": os.path.splitext(file.filename)[0] if file.filename else "Uploaded File",
+        "author_name": None,
+        "author_url": None,
+        "summary_mode": resolved_summary_mode,
+        "summary_style": resolved_summary_style,
+        "summary_chunk_total": None,
+        "summary_chunk_done": None,
+        "summary_meta": None,
+        "transcription_meta": json.dumps(
+            {"provider": "browser", "stage": "browser_upload", "message": "浏览器正在上传媒体", "upload_progress": 0.0},
+            ensure_ascii=False,
+        ),
+    }
+    db.save_task(task_id, task_data)
+    await notify_task_update(task_id)
+
     try:
-        # 保存文件
-        with open(temp_file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-
-        file_size = len(content)
-        file_size_mb = file_size / 1024 / 1024
-
-        # 检查文件大小限制 (500MB)
         max_size = 500 * 1024 * 1024
-        if file_size > max_size:
-            os.remove(temp_file_path)
+        expected_size = int(getattr(file, "size", 0) or 0)
+        if expected_size > max_size:
             raise HTTPException(
                 status_code=400,
-                detail=f"文件过大 ({file_size_mb:.1f}MB)，最大支持 {max_size / 1024 / 1024:.0f}MB"
+                detail=f"文件过大 ({expected_size / 1024 / 1024:.1f}MB)，最大支持 {max_size / 1024 / 1024:.0f}MB",
             )
 
-        resolved_summary_mode = _normalize_summary_mode(summary_mode)
+        file_size = 0
+        last_reported_percent = -1
+        with open(temp_file_path, "wb") as buffer:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                file_size += len(chunk)
+                if file_size > max_size:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"文件过大 ({file_size / 1024 / 1024:.1f}MB)，最大支持 {max_size / 1024 / 1024:.0f}MB",
+                    )
+                buffer.write(chunk)
 
-        # 创建任务记录
-        task_data = {
-            "id": task_id,
-            "video_url": f"file://{temp_file_path}",
-            "status": TaskStatus.UPLOADING,
-            "created_at": datetime.utcnow(),
-            "latest_modified_at": datetime.utcnow(),
-            "progress": 0.0,
-            "title": _normalize_task_title(title, os.path.splitext(file.filename)[0] if file.filename else "Uploaded File"),
-            "author_name": None,
-            "author_url": None,
-            "summary_mode": resolved_summary_mode,
-            "summary_chunk_total": None,
-            "summary_chunk_done": None,
-            "summary_meta": None,
-        }
-        db.save_task(task_id, task_data)
+                upload_percent = int(file_size * 100 / expected_size) if expected_size > 0 else 0
+                if upload_percent >= last_reported_percent + 5:
+                    last_reported_percent = upload_percent
+                    from .task_updater import update_and_notify
+                    await update_and_notify(
+                        task_id,
+                        {
+                            "progress": float(min(upload_percent, 99)),
+                            "transcription_meta": json.dumps(
+                                {
+                                    "provider": "browser",
+                                    "stage": "browser_upload",
+                                    "message": f"浏览器上传中（{min(upload_percent, 99)}%）",
+                                    "upload_progress": float(min(upload_percent, 99)),
+                                    "uploaded_bytes": file_size,
+                                    "total_bytes": expected_size or None,
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    )
+
+        from .task_updater import update_and_notify
+        await update_and_notify(
+            task_id,
+            {
+                "progress": 100.0,
+                "transcription_meta": json.dumps(
+                    {
+                        "provider": "browser",
+                        "stage": "browser_upload_complete",
+                        "message": "浏览器上传完成，正在进入听悟转录",
+                        "upload_progress": 100.0,
+                        "uploaded_bytes": file_size,
+                        "total_bytes": expected_size or file_size,
+                    },
+                    ensure_ascii=False,
+                ),
+            },
+        )
 
         # 提交给 FileUploadWorker 处理（懒初始化）
         worker = await _resolve_worker_or_raise(get_file_upload_worker, task_id=task_id)
@@ -819,14 +907,21 @@ async def upload_file(
             "task_id": task_id,
             "file_path": temp_file_path,
             "filename": file.filename or "uploaded_file",
-                "summary_mode": resolved_summary_mode,
+            "summary_mode": resolved_summary_mode,
+            "summary_style": resolved_summary_style,
             })
 
         await notify_task_update(task_id)
-        return task_data
+        return db.get_task(task_id)
 
-    except HTTPException:
-        # 重新抛出 HTTP 异常
+    except HTTPException as error:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+        from .task_updater import update_and_notify
+        await update_and_notify(
+            task_id,
+            {"status": TaskStatus.FAILED, "error_message": str(error.detail)},
+        )
         raise
     except Exception as e:
         # 清理临时文件
@@ -921,8 +1016,6 @@ async def upload_local_path(payload: LocalPathTaskCreate, request: Request):
             status_code=403,
             detail="仅允许本机 localhost 请求使用本地路径直读。"
         )
-    if not _is_asr_transcription_enabled():
-        raise HTTPException(status_code=400, detail="当前未开启模型语音识别（ASR），仅支持字幕来源任务。")
 
     raw_path = (payload.file_path or "").strip().strip('"')
     if not raw_path:
@@ -940,9 +1033,11 @@ async def upload_local_path(payload: LocalPathTaskCreate, request: Request):
         )
 
     task_id = str(uuid.uuid4())
-    title = _normalize_task_title(payload.title, os.path.splitext(os.path.basename(local_path))[0] or "Local File")
+    title = os.path.splitext(os.path.basename(local_path))[0] or "Local File"
     resolved_summary_mode = _normalize_summary_mode(payload.summary_mode)
-    os.makedirs("temp", exist_ok=True)
+    resolved_summary_style = _normalize_summary_style(payload.summary_style)
+    temp_dir = config.app.temp_dir
+    os.makedirs(temp_dir, exist_ok=True)
     task_data = {
         "id": task_id,
         "video_url": f"file://{local_path}",
@@ -954,6 +1049,7 @@ async def upload_local_path(payload: LocalPathTaskCreate, request: Request):
         "author_name": None,
         "author_url": None,
         "summary_mode": resolved_summary_mode,
+        "summary_style": resolved_summary_style,
         "summary_chunk_total": None,
         "summary_chunk_done": None,
         "summary_meta": None,
@@ -963,8 +1059,9 @@ async def upload_local_path(payload: LocalPathTaskCreate, request: Request):
     payload_data = build_transcriber_payload(
         task_id=task_id,
         media_path=local_path,
-        output_dir="temp",
+        output_dir=temp_dir,
         summary_mode=resolved_summary_mode,
+        summary_style=resolved_summary_style,
     )
 
     worker = await _resolve_worker_or_raise(get_transcriber_worker, task_id=task_id)
@@ -973,82 +1070,91 @@ async def upload_local_path(payload: LocalPathTaskCreate, request: Request):
     return task_data
 
 
-@app.post("/tasks/subtitle", response_model=Task, status_code=201)
-async def create_subtitle_task(
-    subtitle_file: UploadFile | None = File(default=None),
-    subtitle_text: Optional[str] = Form(default=None),
-    title: Optional[str] = Form(default=None),
-    summary_mode: Optional[str] = Form(default=None),
-):
-    provided_text = str(subtitle_text or "").strip()
-    if subtitle_file is None and not provided_text:
-        raise HTTPException(status_code=400, detail="请上传字幕文件，或粘贴字幕文本。")
+def _normalize_raw_transcript_text(raw_text: str) -> str:
+    text = (raw_text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="文本内容不能为空")
+    return text
 
-    file_content = ""
-    source_name = "pasted_text"
-    if subtitle_file is not None:
-        source_name = subtitle_file.filename or "uploaded_subtitle"
-        try:
-            raw_bytes = await subtitle_file.read()
-            file_content = raw_bytes.decode("utf-8", errors="replace")
-            logger.info(
-                f"[SubtitleUpload] 收到字幕文件: name={source_name}, size={len(raw_bytes)} bytes"
-            )
-        except Exception as e:
-            logger.error(f"[SubtitleUpload] 读取字幕文件失败: {e}", exc_info=True)
-            raise HTTPException(status_code=400, detail="字幕文件读取失败，请检查文件编码后重试。")
 
-    raw_subtitle = provided_text or file_content
-    normalized_transcript = _normalize_subtitle_text(raw_subtitle, source_name)
-    if not normalized_transcript:
-        raise HTTPException(status_code=400, detail="未识别到可用字幕文本，请检查内容。")
+def _derive_raw_text_title(text: str, title: str | None = None) -> str:
+    candidate = (title or "").strip()
+    if not candidate:
+        for line in text.splitlines():
+            stripped = line.strip()
+            if stripped:
+                candidate = stripped
+                break
+    if not candidate:
+        candidate = "粘贴文本输入"
+    candidate = re.sub(r"\s+", " ", candidate).strip()
+    return candidate[:80] if len(candidate) > 80 else candidate
 
+
+@app.post("/tasks/raw-text", response_model=Task, status_code=201)
+async def create_raw_text_task(payload: RawTextTaskCreate):
+    """
+    Submit raw ASR/transcript text directly into the summarization pipeline.
+    This skips subtitle extraction, video download, and local transcription.
+    """
+    transcript_text = _normalize_raw_transcript_text(payload.text)
     task_id = str(uuid.uuid4())
-    resolved_summary_mode = _normalize_summary_mode(summary_mode)
-    task_title = _normalize_task_title(title, "字幕总结任务")
+    resolved_summary_mode = _normalize_summary_mode(payload.summary_mode)
+    resolved_summary_style = _normalize_summary_style(payload.summary_style)
+    title = _derive_raw_text_title(transcript_text, payload.title)
 
-    os.makedirs("temp", exist_ok=True)
-    intermediate_file_path = os.path.join("temp", f"{task_id}_subtitle_input.txt")
-    output_file = os.path.join("temp", f"{task_id}_summary.md")
-    with open(intermediate_file_path, "w", encoding="utf-8", errors="replace") as f:
-        f.write(normalized_transcript)
+    temp_dir = config.app.temp_dir
+    os.makedirs(temp_dir, exist_ok=True)
+    intermediate_file_path = os.path.join(temp_dir, f"{task_id}_raw_text.txt")
+    output_file = os.path.join(temp_dir, f"{task_id}_summary.md")
+
+    try:
+        with open(intermediate_file_path, "w", encoding="utf-8", errors="replace") as f:
+            f.write(transcript_text)
+    except Exception as e:
+        logger.error(f"写入粘贴文本任务失败: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"写入粘贴文本失败: {e}") from e
 
     task_data = {
         "id": task_id,
-        "video_url": "subtitle://uploaded",
+        "video_url": "粘贴文本输入",
         "status": TaskStatus.SUMMARIZING,
         "created_at": datetime.utcnow(),
         "latest_modified_at": datetime.utcnow(),
         "progress": 0.0,
-        "title": task_title,
-        "transcript": normalized_transcript,
-        "transcription_time": 0.0,
+        "title": title,
+        "topic": None,
+        "transcript": transcript_text,
+        "summary": "",
+        "error_message": None,
         "audio_duration": None,
+        "transcription_time": None,
         "author_name": None,
         "author_url": None,
         "summary_mode": resolved_summary_mode,
+        "summary_style": resolved_summary_style,
         "summary_chunk_total": None,
         "summary_chunk_done": None,
-        "summary_meta": None,
+        "summary_meta": json.dumps({"input_type": "raw_text"}, ensure_ascii=False),
+        "transcription_meta": json.dumps(
+            {"provider": "raw_text", "stage": "completed", "message": "已直接导入转录文本"},
+            ensure_ascii=False,
+        ),
     }
     db.save_task(task_id, task_data)
 
-    logger.info(
-        f"[SubtitleUpload] 创建字幕总结任务: task_id={task_id}, source={source_name}, "
-        f"mode={resolved_summary_mode}, title={task_title}, transcript_chars={len(normalized_transcript)}"
-    )
-
     worker = await _resolve_worker_or_raise(get_llm_worker, task_id=task_id)
-    await worker.add_task(
-        {
-            "task_id": task_id,
-            "intermediate_file_path": intermediate_file_path,
-            "output_file": output_file,
-            "summary_mode": resolved_summary_mode,
-        }
-    )
+    await worker.add_task({
+        "task_id": task_id,
+        "intermediate_file_path": intermediate_file_path,
+        "output_file": output_file,
+        "summary_mode": resolved_summary_mode,
+        "summary_style": resolved_summary_style,
+    })
+
     await notify_task_update(task_id)
     return task_data
+
 
 async def _get_bilibili_video_title_and_parts(video_url: str) -> tuple[str, list]:
     """获取 B 站视频标题和分P信息。返回 (title, parts_list)。"""
@@ -1096,10 +1202,6 @@ async def create_task(task_in: TaskCreate):
     """
     提交一个新的视频处理任务
     """
-    input_video_url = str(task_in.video_url)
-    if not _is_bilibili_video_url(input_video_url):
-        raise HTTPException(status_code=400, detail="当前版本仅支持 B 站链接字幕总结，非 B 站链接请改用上传字幕。")
-
     # 处理 B 站分P拆分模式
     if task_in.bilibili_parts and task_in.bilibili_parts.mode == "separate":
         # 获取视频标题和分P信息
@@ -1110,11 +1212,26 @@ async def create_task(task_in: TaskCreate):
             video_title = "未知标题"
             parts_info = []
 
+        # 自动创建文件夹，将所有分P任务归入
+        folder_id = str(uuid.uuid4())
+        folder_data = {
+            "id": folder_id,
+            "name": video_title,
+            "parent_id": None,
+            "folder_type": "auto",
+            "source_video_url": str(task_in.video_url),
+            "sort_order": 0,
+            "created_at": datetime.utcnow(),
+        }
+        db.create_folder(folder_data)
+        await manager.broadcast(json.dumps({"type": "folder_created", "folder": db.get_folder(folder_id)}))
+
         # 为每个选中的分P创建独立任务
         first_task_data = None
         for part_index in task_in.bilibili_parts.indices:
             task_id = str(uuid.uuid4())
             resolved_summary_mode = _normalize_summary_mode(task_in.summary_mode)
+            resolved_summary_style = _normalize_summary_style(task_in.summary_style)
 
             # 获取分P标题
             part_title = ""
@@ -1124,9 +1241,9 @@ async def create_task(task_in: TaskCreate):
                     break
 
             # 构建任务标题
-            task_title = _normalize_task_title(task_in.title, f"{video_title} - P{part_index + 1}")
+            task_title = f"{video_title} - P{part_index + 1}"
             if part_title:
-                task_title = _normalize_task_title(task_in.title, f"{video_title} - P{part_index + 1}: {part_title}")
+                task_title = f"{video_title} - P{part_index + 1}: {part_title}"
 
             task_data = {
                 "id": task_id,
@@ -1136,9 +1253,11 @@ async def create_task(task_in: TaskCreate):
                 "latest_modified_at": datetime.utcnow(),
                 "progress": 0.0,
                 "title": task_title,
+                "folder_id": folder_id,
                 "author_name": None,
                 "author_url": None,
                 "summary_mode": resolved_summary_mode,
+                "summary_style": resolved_summary_style,
                 "summary_chunk_total": None,
                 "summary_chunk_done": None,
                 "summary_meta": None,
@@ -1151,7 +1270,7 @@ async def create_task(task_in: TaskCreate):
                 "video_url": str(task_in.video_url),
                 "quality": task_in.quality,
                 "summary_mode": resolved_summary_mode,
-                "subtitle_only": True,
+                "summary_style": resolved_summary_style,
                 # 传递单个分P索引，让 worker 处理该分P
                 "bilibili_parts": {
                     "mode": "merge",  # 单个分P用 merge 模式即可
@@ -1174,17 +1293,18 @@ async def create_task(task_in: TaskCreate):
     # 普通任务或 merge 模式
     task_id = str(uuid.uuid4())
     resolved_summary_mode = _normalize_summary_mode(task_in.summary_mode)
+    resolved_summary_style = _normalize_summary_style(task_in.summary_style)
     task_data = {
         "id": task_id,
-        "video_url": input_video_url,
+        "video_url": str(task_in.video_url),
         "status": TaskStatus.PENDING,
         "created_at": datetime.utcnow(),
         "latest_modified_at": datetime.utcnow(),
         "progress": 0.0,
-        "title": _normalize_task_title(task_in.title, "B站字幕总结任务"),
         "author_name": None,
         "author_url": None,
         "summary_mode": resolved_summary_mode,
+        "summary_style": resolved_summary_style,
         "summary_chunk_total": None,
         "summary_chunk_done": None,
         "summary_meta": None,
@@ -1194,10 +1314,10 @@ async def create_task(task_in: TaskCreate):
     worker = await _resolve_worker_or_raise(get_downloader_worker, task_id=task_id)
     task_payload = {
         "task_id": task_id,
-        "video_url": input_video_url,
+        "video_url": str(task_in.video_url),
         "quality": task_in.quality,
         "summary_mode": resolved_summary_mode,
-        "subtitle_only": True,
+        "summary_style": resolved_summary_style,
     }
     task_cookie = _sanitize_cookie_value(task_in.bilibili_sessdata)
     if task_cookie:
@@ -1235,6 +1355,36 @@ async def get_task(task_id: str):
     _trigger_author_resolution_if_needed(task)
     return task
 
+
+@app.get("/tasks/{task_id}/subtitle")
+async def download_task_subtitle(task_id: str):
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    try:
+        metadata = json.loads(str(task.get("transcription_meta") or "{}"))
+    except json.JSONDecodeError:
+        metadata = {}
+    subtitle_value = str(metadata.get("subtitle_path") or "").strip()
+    if not subtitle_value:
+        raise HTTPException(status_code=404, detail="该任务没有 SRT 字幕产物")
+
+    subtitle_path = Path(subtitle_value).expanduser().resolve()
+    allowed_root = Path(config.app.temp_dir).expanduser().resolve()
+    try:
+        subtitle_path.relative_to(allowed_root)
+    except ValueError as error:
+        raise HTTPException(status_code=403, detail="字幕路径不在任务临时目录中") from error
+    if not subtitle_path.is_file():
+        raise HTTPException(status_code=404, detail="SRT 字幕文件已不存在")
+
+    safe_title = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff._-]+", "-", str(task.get("title") or task_id)).strip("-.")
+    return FileResponse(
+        subtitle_path,
+        media_type="application/x-subrip",
+        filename=f"{safe_title or task_id}.srt",
+    )
+
 @app.patch("/tasks/{task_id}", response_model=Task)
 async def update_task(task_id: str, task_update: TaskUpdate):
     """
@@ -1269,7 +1419,11 @@ async def re_summarize_task(task_id: str, payload: ReSummarizeRequest | None = N
         requested_mode,
         fallback=str(task.get("summary_mode") or ""),
     )
-
+    requested_style = payload.summary_style if payload else None
+    resolved_summary_style = _normalize_summary_style(
+        requested_style,
+        fallback=str(task.get("summary_style") or "classic"),
+    )
     from .task_updater import update_and_notify
     worker = await get_llm_worker()
     await update_and_notify(
@@ -1278,23 +1432,27 @@ async def re_summarize_task(task_id: str, payload: ReSummarizeRequest | None = N
             "status": TaskStatus.SUMMARIZING,
             "summary": "",
             "progress": 0.0,
+            "error_message": None,
             "summary_mode": resolved_summary_mode,
+            "summary_style": resolved_summary_style,
             "summary_chunk_total": None,
             "summary_chunk_done": None,
             "summary_meta": None,
         },
     )
 
-    temp_file = os.path.join("temp", f"{task_id}_re.txt")
-    os.makedirs("temp", exist_ok=True)
+    temp_dir = config.app.temp_dir
+    temp_file = os.path.join(temp_dir, f"{task_id}_re.txt")
+    os.makedirs(temp_dir, exist_ok=True)
     with open(temp_file, "w", encoding="utf-8") as f:
         f.write(task["transcript"])
 
     await worker.add_task({
         "task_id": task_id,
         "intermediate_file_path": temp_file,
-        "output_file": os.path.join("temp", f"{task_id}_re_summary.md"),
+        "output_file": os.path.join(temp_dir, f"{task_id}_re_summary.md"),
         "summary_mode": resolved_summary_mode,
+        "summary_style": resolved_summary_style,
     })
 
     return db.get_task(task_id)
@@ -1385,6 +1543,13 @@ async def re_transcribe_task(task_id: str, payload: ReTranscribeRequest | None =
         requested_mode,
         fallback=str(task.get("summary_mode") or ""),
     )
+    requested_style = payload.summary_style if payload else None
+    resolved_summary_style = _normalize_summary_style(
+        requested_style,
+        fallback=str(task.get("summary_style") or "classic"),
+    )
+    temp_dir = config.app.temp_dir
+    os.makedirs(temp_dir, exist_ok=True)
 
     local_media_file = _resolve_local_media_file(task_id, task)
     video_url = str(task.get("video_url") or "")
@@ -1403,6 +1568,7 @@ async def re_transcribe_task(task_id: str, payload: ReTranscribeRequest | None =
         "topic": None,
         "status": TaskStatus.PENDING,
         "summary_mode": resolved_summary_mode,
+        "summary_style": resolved_summary_style,
         "summary_chunk_total": None,
         "summary_chunk_done": None,
         "summary_meta": None,
@@ -1417,8 +1583,9 @@ async def re_transcribe_task(task_id: str, payload: ReTranscribeRequest | None =
             build_transcriber_payload(
                 task_id=task_id,
                 media_path=local_media_file,
-                output_dir="temp",
+                output_dir=temp_dir,
                 summary_mode=resolved_summary_mode,
+                summary_style=resolved_summary_style,
             )
         )
         return db.get_task(task_id)
@@ -1430,6 +1597,7 @@ async def re_transcribe_task(task_id: str, payload: ReTranscribeRequest | None =
         "video_url": video_url,
         "quality": "audio_only",
         "summary_mode": resolved_summary_mode,
+        "summary_style": resolved_summary_style,
     })
     return db.get_task(task_id)
 
@@ -1471,23 +1639,183 @@ async def delete_task(task_id: str):
     return None
 
 
+# ── Folder API ──
+
+@app.post("/folders/", response_model=Folder, status_code=201)
+async def create_folder(folder_in: FolderCreate):
+    folder_id = str(uuid.uuid4())
+    folder_data = {
+        "id": folder_id,
+        "name": folder_in.name,
+        "parent_id": folder_in.parent_id,
+        "folder_type": "manual",
+        "source_video_url": None,
+        "sort_order": 0,
+        "created_at": datetime.utcnow(),
+    }
+    result = db.create_folder(folder_data)
+    await manager.broadcast(json.dumps({"type": "folder_created", "folder": result}))
+    return result
+
+
+@app.get("/folders/", response_model=List[Folder])
+async def list_folders(include_tasks: bool = False):
+    folders = db.list_folders()
+    if include_tasks:
+        for folder in folders:
+            folder["task_ids"] = [t["id"] for t in db.list_tasks_in_folder(folder["id"])]
+    return folders
+
+
+@app.get("/folders/{folder_id}", response_model=Folder)
+async def get_folder(folder_id: str):
+    folder = db.get_folder(folder_id)
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    return folder
+
+
+@app.patch("/folders/{folder_id}", response_model=Folder)
+async def update_folder(folder_id: str, folder_update: FolderUpdate):
+    folder = db.get_folder(folder_id)
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    updates = folder_update.dict(exclude_unset=True)
+    result = db.update_folder(folder_id, updates)
+    await manager.broadcast(json.dumps({"type": "folder_updated", "folder": result}))
+    return result
+
+
+@app.delete("/folders/{folder_id}", status_code=204)
+async def delete_folder(folder_id: str):
+    folder = db.get_folder(folder_id)
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    db.delete_folder(folder_id)
+    await manager.broadcast(json.dumps({"type": "folder_deleted", "folder_id": folder_id}))
+    return None
+
+
+@app.patch("/tasks/{task_id}/folder", response_model=Task)
+async def assign_task_folder(task_id: str, payload: TaskFolderAssign):
+    task = db.get_task(task_id)
+    if not task:
+        raise HTTPException(status_code=404, detail="Task not found")
+    db.assign_task_to_folder(task_id, payload.folder_id)
+    updated = db.get_task(task_id)
+    await notify_task_update(task_id, updated)
+    return updated
+
+
+@app.post("/folders/backfill-multi-p")
+async def backfill_multi_p_folders():
+    """一键迁移历史多P任务到文件夹：扫描 title 匹配 "XXX - Pn" 的任务并自动建文件夹。"""
+    import re
+    tasks = db.list_tasks()
+    pattern = re.compile(r"(.+?) - P\d+")
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    ungrouped = []
+
+    for task in tasks:
+        title = str(task.get("title") or "")
+        m = pattern.match(title)
+        if m:
+            prefix = m.group(1)
+            if prefix not in groups:
+                groups[prefix] = []
+            groups[prefix].append(task)
+        else:
+            ungrouped.append(task)
+
+    created_folders = 0
+    assigned_tasks = 0
+
+    for prefix, group_tasks in groups.items():
+        if len(group_tasks) < 2:
+            continue
+        # Check if a folder for this prefix already exists
+        existing_folders = db.list_folders()
+        existing = next(
+            (f for f in existing_folders if f["name"] == prefix and f["folder_type"] == "auto"),
+            None,
+        )
+        if existing:
+            folder_id = existing["id"]
+        else:
+            folder_id = str(uuid.uuid4())
+            db.create_folder({
+                "id": folder_id,
+                "name": prefix,
+                "parent_id": None,
+                "folder_type": "auto",
+                "source_video_url": group_tasks[0].get("video_url"),
+                "sort_order": 0,
+                "created_at": datetime.utcnow(),
+            })
+            created_folders += 1
+
+        for task in group_tasks:
+            if not task.get("folder_id"):
+                db.assign_task_to_folder(task["id"], folder_id)
+                assigned_tasks += 1
+
+    return {
+        "created_folders": created_folders,
+        "assigned_tasks": assigned_tasks,
+        "groups_found": len(groups),
+        "ungrouped_tasks": len(ungrouped),
+    }
+
+
+@app.post("/tasks/backfill-titles")
+async def backfill_task_titles():
+    """回填所有 title 为空的任务：使用 yt-dlp 从视频 URL 提取标题。"""
+    tasks = db.list_tasks()
+    null_title_tasks = [t for t in tasks if not t.get("title")]
+    updated = 0
+    skipped = 0
+
+    for task in null_title_tasks:
+        video_url = task.get("video_url", "")
+        if not video_url:
+            skipped += 1
+            continue
+        try:
+            with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True, 'extract_flat': True}) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+            title = info.get("title")
+            if title:
+                from .task_updater import update_and_notify
+                await update_and_notify(task["id"], {"title": str(title)})
+                updated += 1
+            else:
+                skipped += 1
+        except Exception as e:
+            logger.warning(f"回填标题失败 (task={task['id']}, url={video_url}): {e}")
+            skipped += 1
+
+    return {"updated": updated, "skipped": skipped, "total_null_titles": len(null_title_tasks)}
+
+
 @app.get("/llm/providers", response_model=List[LLMProviderInfo])
 async def list_llm_providers():
     """获取可选 LLM 供应商列表。"""
     return llm_provider_manager.list_providers()
 
 
-@app.get("/llm/settings", response_model=LLMSettings)
+@app.get("/llm/settings", response_model=LLMProfilesSettings)
 async def get_llm_settings():
-    """获取当前生效的 LLM 运行时配置（API Key 仅返回掩码）。"""
+    """获取所有 Profile 的 LLM 配置（API Key 仅返回掩码）。"""
     return llm_provider_manager.get_settings()
 
 
-@app.put("/llm/settings", response_model=LLMSettings)
-async def update_llm_settings(payload: LLMSettingsUpdate):
-    """更新 LLM 运行时配置并立即应用到工作单元。"""
+@app.put("/llm/settings", response_model=LLMProfilesSettings)
+async def update_llm_profile(payload: LLMProfileUpdate):
+    """更新指定 Profile 的配置并设为活跃。"""
     try:
-        settings = llm_provider_manager.update_settings(
+        settings = llm_provider_manager.update_profile(
+            profile_id=payload.profile_id,
+            name=payload.name,
             provider=payload.provider,
             base_url=payload.base_url,
             api_key=payload.api_key,
@@ -1495,7 +1823,54 @@ async def update_llm_settings(payload: LLMSettingsUpdate):
             temperature=payload.temperature,
             context_window_size=payload.context_window_size,
         )
-        config_manager.save_llm_config(llm_provider_manager.export_runtime_config())
+        # Persist to settings.json
+        config_manager.update_profile(payload.profile_id, payload.model_dump(exclude_none=True, exclude={"profile_id"}))
+        return settings
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/llm/profiles", response_model=LLMProfilesSettings)
+async def create_llm_profile(payload: LLMProfileCreate):
+    """创建新的 LLM Profile。"""
+    try:
+        result = llm_provider_manager.add_profile(
+            name=payload.name,
+            provider=payload.provider,
+            base_url=payload.base_url,
+            api_key=payload.api_key,
+            model_id=payload.model_id,
+            temperature=payload.temperature,
+        )
+        new_profile_id = result.pop("new_profile_id")
+        # Persist to settings.json with the same profile_id
+        config_manager.add_profile(
+            payload.name, payload.provider,
+            payload.model_dump(exclude_none=True, exclude={"name", "provider"}),
+            profile_id=new_profile_id,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.delete("/llm/profiles/{profile_id}", response_model=LLMProfilesSettings)
+async def delete_llm_profile(profile_id: str):
+    """删除 LLM Profile。不能删除最后一个。"""
+    try:
+        settings = llm_provider_manager.delete_profile(profile_id)
+        config_manager.delete_profile(profile_id)
+        return settings
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.put("/llm/active-profile", response_model=LLMProfilesSettings)
+async def set_active_llm_profile(payload: LLMActiveProfileUpdate):
+    """切换活跃 LLM Profile（不修改配置）。"""
+    try:
+        settings = llm_provider_manager.switch_profile(payload.profile_id)
+        config_manager.set_active_profile(payload.profile_id)
         return settings
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
@@ -1610,12 +1985,16 @@ async def update_transcription_settings(payload: TranscriptionSettingsUpdate):
     """更新转录运行时设置并应用到转录工作单元。"""
     try:
         settings = transcription_settings_manager.update_settings(
+            tingwu_enabled=payload.tingwu_enabled,
+            tingwu_config_path=payload.tingwu_config_path,
+            tingwu_poll_interval_sec=payload.tingwu_poll_interval_sec,
+            tingwu_timeout_sec=payload.tingwu_timeout_sec,
+            tingwu_fallback_to_whisper=payload.tingwu_fallback_to_whisper,
             device=payload.device,
             model_source=payload.model_source,
             model_size=payload.model_size,
             model_path=payload.model_path,
             enable_bilibili_subtitle_fetch=payload.enable_bilibili_subtitle_fetch,
-            enable_asr_transcription=payload.enable_asr_transcription,
             bilibili_sessdata=payload.bilibili_sessdata,
             clear_bilibili_sessdata=payload.clear_bilibili_sessdata,
         )
@@ -1623,6 +2002,26 @@ async def update_transcription_settings(payload: TranscriptionSettingsUpdate):
         return settings
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/transcription/tingwu/check")
+async def check_tingwu_auth():
+    """验证当前听悟认证配置，不返回 Cookie 等敏感字段。"""
+    from tingwu.tingwu_http_transcribe import validate_auth_config
+
+    runtime_state = transcription_settings_manager.get_runtime_state()
+    config_path = str(runtime_state.get("tingwu_config_path") or "")
+    return await asyncio.to_thread(validate_auth_config, config_path)
+
+
+@app.put("/transcription/tingwu/session")
+async def update_tingwu_session(payload: TingwuSessionUpdate):
+    """更新听悟 Session，立即验证；验证失败时客户端会保留原配置。"""
+    from tingwu.tingwu_http_transcribe import update_auth_session
+
+    runtime_state = transcription_settings_manager.get_runtime_state()
+    config_path = str(runtime_state.get("tingwu_config_path") or "")
+    return await asyncio.to_thread(update_auth_session, config_path, payload.session)
 
 
 @app.post("/bilibili/video-info", response_model=BilibiliVideoInfo)
@@ -1727,12 +2126,14 @@ async def get_summarization_settings():
         mode=str(cfg.mode),
         auto_chunk_min_audio_duration_sec=int(cfg.auto_chunk_min_audio_duration_sec),
         auto_chunk_min_transcript_lines=int(cfg.auto_chunk_min_transcript_lines),
+        auto_chunk_min_plain_text_chars=int(cfg.auto_chunk_min_plain_text_chars),
         chunk_target_duration_sec=int(cfg.chunk_target_duration_sec),
         chunk_min_duration_sec=int(cfg.chunk_min_duration_sec),
         chunk_max_duration_sec=int(cfg.chunk_max_duration_sec),
         boundary_jump_sec=int(cfg.boundary_jump_sec),
         prev_tail_timestamp_lines_m=int(cfg.prev_tail_timestamp_lines_m),
         prev_summary_tail_chars_j=int(cfg.prev_summary_tail_chars_j),
+        summary_detail_level=int(cfg.summary_detail_level),
         llm_call_retry_max=int(cfg.llm_call_retry_max),
         max_agent_value_chars=int(cfg.max_agent_value_chars),
         fallback_to_standard_on_agent_error=bool(cfg.fallback_to_standard_on_agent_error),
@@ -1766,8 +2167,4 @@ async def websocket_endpoint(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-    if not _is_asr_transcription_enabled():
-        raise HTTPException(status_code=400, detail="当前未开启模型语音识别（ASR），仅支持字幕来源任务。")
 
-    if not _is_asr_transcription_enabled():
-        raise HTTPException(status_code=400, detail="当前未开启模型语音识别（ASR），仅支持字幕来源任务。")
