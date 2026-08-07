@@ -743,7 +743,10 @@ export function useTaskViewModel() {
       return response.data as BilibiliVideoInfo
     } catch (err) {
       console.error('Failed to check Bilibili video info:', err)
-      return null
+      if (axios.isAxiosError(err) && err.response) {
+        throw new Error(err.response.data?.detail || '获取 B 站视频信息失败')
+      }
+      throw err
     }
   }
 

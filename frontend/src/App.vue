@@ -624,9 +624,9 @@ const handleSubmit = async () => {
         await submitTask(summaryStyle)
       }
     } catch (err) {
-      // 检查失败，直接提交（后端会处理）
       console.error('Failed to check Bilibili video info:', err)
-      await submitTask(summaryStyle)
+      const detail = err instanceof Error && err.message ? `：${err.message}` : ''
+      error.value = `无法获取 B 站视频分P信息${detail}。请稍后重试。`
     } finally {
       isCheckingBilibiliVideoInfo.value = false
     }

@@ -1156,9 +1156,17 @@ async def create_raw_text_task(payload: RawTextTaskCreate):
     return task_data
 
 
+def _create_bilibili_video_client(bvid: str):
+    from bilibili_api import Credential, video
+
+    sessdata, _ = transcription_settings_manager.resolve_bilibili_sessdata()
+    credential = Credential(sessdata=sessdata) if sessdata else None
+    return video.Video(bvid=bvid, credential=credential)
+
+
 async def _get_bilibili_video_title_and_parts(video_url: str) -> tuple[str, list]:
     """获取 B 站视频标题和分P信息。返回 (title, parts_list)。"""
-    from bilibili_api import video, sync
+    from bilibili_api import sync
     import re
     from urllib.request import Request, urlopen
 
@@ -1182,7 +1190,7 @@ async def _get_bilibili_video_title_and_parts(video_url: str) -> tuple[str, list
     else:
         bvid = match.group(1)
 
-    video_obj = video.Video(bvid=bvid)
+    video_obj = _create_bilibili_video_client(bvid)
     info = sync(video_obj.get_info())
 
     title = str(info.get("title") or "未知标题")
@@ -2035,7 +2043,7 @@ async def get_bilibili_video_info(payload: BilibiliVideoInfoRequest):
         raise HTTPException(status_code=400, detail="不是有效的 B 站视频链接")
 
     try:
-        from bilibili_api import video, sync
+        from bilibili_api import sync
         import re
         from urllib.request import Request, urlopen
 
@@ -2060,7 +2068,7 @@ async def get_bilibili_video_info(payload: BilibiliVideoInfoRequest):
             bvid = match.group(1)
 
         # 获取视频信息
-        video_obj = video.Video(bvid=bvid)
+        video_obj = _create_bilibili_video_client(bvid)
         info = sync(video_obj.get_info())
 
         title = str(info.get("title") or "")
